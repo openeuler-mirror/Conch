@@ -70,7 +70,7 @@ func ResumeSandbox(
 		return nil
 	})
 
-	snapfilePath := snapshotConf.SnapDir()
+	snapfilePath := snapshotConf.CurrentSnapshotDir()
 
 	vmmResourceArgs := &vmm.ResourceArgs{
 		CPUBoot:         defaultCPUBoot,

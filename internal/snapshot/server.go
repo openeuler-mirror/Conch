@@ -27,6 +27,13 @@ type server struct {
 	viewMgr         *viewManager
 }
 
+type resumeWorkspacePlan struct {
+	rootfs            SnapshotLocator
+	mem               SnapshotLocator
+	vmViewAliasKey    string
+	vmViewSnapshotKey string
+}
+
 var gServer server
 
 // NewServer initializes the snapshot server with containerd client.
@@ -570,8 +577,8 @@ func (s *server) AcquireView(
 }
 
 // AcquireResumeWorkspace prepares a restore workspace for snapshot-based startup.
-// Rootfs and VM remain shared views, while mem is prepared as an active layer so
-// the snapshot config can be rewritten before restore.
+// Rootfs and mem are prepared as active layers so a resumed sandbox can later be
+// committed again, while VM remains a shared view.
 func (s *server) AcquireResumeWorkspace(
 	ctx context.Context,
 	namespace, key string,
@@ -581,20 +588,22 @@ func (s *server) AcquireResumeWorkspace(
 	opts ...Opt,
 ) (_ *SnapshotConfig, err error) {
 	memKey := getMemKeyFromRootfs(key)
-	rootfsViewAliasKey := getRootfsViewAliasKey(key)
-	rootfsViewSnapshotKey := getSharedViewSnapshotKey(common.SnapshotMountRootfs, parents.Rootfs)
-	vmViewAliasKey := getVMViewAliasKey(key)
-	vmViewSnapshotKey := getSharedViewSnapshotKey(common.SnapshotMountVM, parents.VM)
-
-	conf := &SnapshotConfig{
-		Rootfs: getSharedMountPath(s.workDir, namespace, parents.Rootfs),
-		MemDir: getActiveMountPath(s.workDir, namespace, key, common.SnapshotMountMem),
-		VmDir:  getSharedMountPath(s.workDir, namespace, parents.VM),
-	}
+	plan := buildResumeWorkspacePlan(namespace, key, parents)
+	conf := newResumeWorkspaceConfig(s.workDir, namespace, key, parents)
 	conf.initDefaults()
+	rootfsInfo, err := s.snt.Stat(ctx, namespace, parents.Rootfs)
+	if err != nil {
+		return nil, fmt.Errorf("stat rootfs snapshot %s failed: %w", parents.Rootfs, err)
+	}
+	mergeLabels(&rootfsInfo, conf)
 	for _, o := range opts {
 		o(conf)
 	}
+	nextSnapshotID, err := CalculateSnapshotID(namespace, key, parents.Rootfs)
+	if err != nil {
+		return nil, fmt.Errorf("calculate next snapshot id failed: %w", err)
+	}
+	conf.NextSnapshotRoot = nextSnapshotRootDir(nextSnapshotID)
 	conf.createLabels()
 
 	ops := &snapshotOps{server: s}
@@ -621,24 +630,29 @@ func (s *server) AcquireResumeWorkspace(
 		}
 	}()
 
-	rootfsCleaner, err := ops.viewSnapshot(ctx, namespace, parents.Rootfs, rootfsViewAliasKey, rootfsViewSnapshotKey, conf.Rootfs, withLabels(conf))
+	rootfsCleaner, err := ops.prepareAndRegisterSnapshot(
+		ctx,
+		plan.rootfs,
+		conf.Rootfs,
+		withLabels(conf),
+	)
 	if err != nil {
-		return nil, fmt.Errorf("view rootfs failed: %v", err)
+		return nil, fmt.Errorf("prepare rootfs failed: %v", err)
 	}
-	viewCleanups = append(viewCleanups, rootfsCleaner)
+	activeCleanups = append(activeCleanups, cleanupItem{key: key, cleaner: rootfsCleaner})
 
 	conf.pmemFiles, err = listRootfsLayerErofs(conf.Rootfs)
 	if err != nil {
 		return nil, fmt.Errorf("list rootfs layer erofs failed: %v", err)
 	}
 
-	vmCleaner, err := ops.viewSnapshot(ctx, namespace, parents.VM, vmViewAliasKey, vmViewSnapshotKey, conf.VmDir)
+	vmCleaner, err := ops.viewSnapshot(ctx, namespace, parents.VM, plan.vmViewAliasKey, plan.vmViewSnapshotKey, conf.VmDir)
 	if err != nil {
 		return nil, fmt.Errorf("view vm failed: %v", err)
 	}
 	viewCleanups = append(viewCleanups, vmCleaner)
 
-	memCleaner, err := ops.prepareAndRegisterSnapshot(ctx, NewSnapshotLocator(namespace, memKey, parents.Mem), conf.MemDir)
+	memCleaner, err := ops.prepareAndRegisterSnapshot(ctx, plan.mem, conf.MemDir)
 	if err != nil {
 		return nil, err
 	}
@@ -649,7 +663,7 @@ func (s *server) AcquireResumeWorkspace(
 	}
 
 	configUpdater := &configUpdater{}
-	configFilePath := filepath.Join(conf.SnapDir(), common.SnapshotConfigFileName)
+	configFilePath := filepath.Join(conf.CurrentSnapshotDir(), common.SnapshotConfigFileName)
 	if err = configUpdater.updateSnapshotConfig(
 		configFilePath,
 		conf.KernelFile(),
@@ -662,7 +676,28 @@ func (s *server) AcquireResumeWorkspace(
 		return nil, fmt.Errorf("update snapshot config failed: %v", err)
 	}
 
+	if err = prepareSnapshotFiles(conf); err != nil {
+		return nil, fmt.Errorf("prepare next vm snapshot files failed: %v", err)
+	}
+
 	return conf, nil
+}
+
+func buildResumeWorkspacePlan(namespace, key string, parents ParentSnapshotIDs) resumeWorkspacePlan {
+	return resumeWorkspacePlan{
+		rootfs:            NewSnapshotLocator(namespace, key, parents.Rootfs),
+		mem:               NewSnapshotLocator(namespace, getMemKeyFromRootfs(key), parents.Mem),
+		vmViewAliasKey:    getVMViewAliasKey(key),
+		vmViewSnapshotKey: getSharedViewSnapshotKey(common.SnapshotMountVM, parents.VM),
+	}
+}
+
+func newResumeWorkspaceConfig(workDir, namespace, key string, parents ParentSnapshotIDs) *SnapshotConfig {
+	return &SnapshotConfig{
+		Rootfs: getActiveMountPath(workDir, namespace, key, common.SnapshotMountRootfs),
+		MemDir: getActiveMountPath(workDir, namespace, key, common.SnapshotMountMem),
+		VmDir:  getSharedMountPath(workDir, namespace, parents.VM),
+	}
 }
 
 func (s *server) resolveParentSnapshotIDs(namespace, rootfs string, allowEmptyMem bool) (ParentSnapshotIDs, error) {
@@ -719,7 +754,7 @@ func (s *server) Commit(ctx context.Context, namespace, snapshotID, key string, 
 		return fmt.Errorf("vm view alias [%s:%s] not found", namespace, vmViewAliasKey)
 	}
 
-	memSnapshotID, err := CalculateSnapshotID(namespace, memKey, "")
+	memSnapshotID, err := CalculateSnapshotID(namespace, memKey, memInfo.Parent)
 	if err != nil {
 		return fmt.Errorf("calculate mem snapshot id failed: %v", err)
 	}
