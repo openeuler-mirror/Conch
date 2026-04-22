@@ -29,6 +29,15 @@ import (
 	"github.com/vishvananda/netns"
 )
 
+const ipv4ForwardingSysctlPath = "/proc/sys/net/ipv4/ip_forward"
+
+func enableIPv4Forwarding(sysctlPath string) error {
+	if err := os.WriteFile(sysctlPath, []byte("1\n"), 0o644); err != nil {
+		return fmt.Errorf("error enabling ipv4 forwarding via %s: %w", sysctlPath, err)
+	}
+	return nil
+}
+
 func (s *Slot) addVethToBridge(veth *netlink.Veth, hostNS netns.NsHandle) error {
 	// Move Veth device to the host NS
 	err := netlink.LinkSetNsFd(veth, int(hostNS))
@@ -54,7 +63,7 @@ func (s *Slot) addVethToBridge(veth *netlink.Veth, hostNS netns.NsHandle) error 
 		return fmt.Errorf("error finding bridge %s: %w", bridgeName, err)
 	}
 	if err := netlink.LinkSetMaster(vethInHost, bridgeLink); err != nil {
-		return fmt.Errorf("error add veth %s into bridge %s: %w", vethInHost, bridgeLink, err)
+		return fmt.Errorf("error add veth %v into bridge %v: %w", vethInHost, bridgeLink, err)
 	}
 
 	return nil
@@ -101,6 +110,11 @@ func (s *Slot) initSandboxNetwork(tables *iptables.IPTables, sandboxNs netns.NsH
 		return fmt.Errorf("error setting lo device up: %w", err)
 	}
 
+	// DNAT to the guest tap address requires IPv4 forwarding inside the sandbox netns.
+	if err := enableIPv4Forwarding(ipv4ForwardingSysctlPath); err != nil {
+		return err
+	}
+
 	// Add NS default route
 	link, err := netlink.LinkByName(s.VpeerName())
 	if err != nil {
@@ -128,17 +142,11 @@ func (s *Slot) initSandboxNetwork(tables *iptables.IPTables, sandboxNs netns.NsH
 	return nil
 }
 
-func (s *Slot) setHostRoute(tables *iptables.IPTables, hostNS netns.NsHandle) error {
+func (s *Slot) setHostRoute(hostNS netns.NsHandle) error {
 	err := netns.Set(hostNS)
 	if err != nil {
 		return fmt.Errorf("error setting network namespace to %s: %w", hostNS.String(), err)
 	}
-
-	err = tables.Append("nat", "POSTROUTING", "-s", s.VrtNetworkCIDRString(), "-j", "MASQUERADE")
-	if err != nil {
-		return fmt.Errorf("error creating postrouting rule: %w", err)
-	}
-
 	return nil
 }
 
@@ -237,20 +245,12 @@ func (s *Slot) CreateNetwork() (retErr error) {
 	// if the netns network where the sandbox is located needs to perform traffic filtering and forwarding later,
 	// the firewall needs to be enabled.
 
-	return s.setHostRoute(tables, hostNS)
+	return s.setHostRoute(hostNS)
 }
 
 func (s *Slot) RemoveNetwork() error {
 	var errs []error
-	tables, err := iptables.New()
-	if err != nil {
-		errs = append(errs, fmt.Errorf("error initializing iptables: %w", err))
-	} else {
-		err = tables.Delete("nat", "POSTROUTING", "-s", s.VrtNetworkCIDRString(), "-j", "MASQUERADE")
-		if err != nil {
-			errs = append(errs, fmt.Errorf("error deleting postrouting rule: %w", err))
-		}
-	}
+
 	// delete veth device
 	veth, err := netlink.LinkByName(s.VethName())
 	if err != nil {

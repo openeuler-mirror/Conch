@@ -50,14 +50,40 @@ pip install -e ./sdk
 ./bin/conchd
 ```
 
+### 镜像管理
+
+Conch 提供统一的镜像管理命令，用于构建、发布、拉取和解包 Conch 镜像：
+
+```bash
+conch build -f Dockerfile -t localhost/demo-sandbox:latest .
+conch push localhost/demo-sandbox:latest hub.oepkgs.net/conch/demo-sandbox:latest
+conch pull hub.oepkgs.net/conch/demo-sandbox:latest
+conch pull docker.io/library/nginx:latest
+
+# 本地已有 Conch 镜像时可单独解包
+conch unpack hub.oepkgs.net/conch/conch-index:v0.1
+```
+
+其中 `conch pull` 会在拉取后自动完成本地 unpack；`conch unpack` 主要用于本地已有 Conch 镜像时单独解包或排障。
+
+详细用法见 [Conch Image Guide](docs/guide/image.md)。
+
 ### Python SDK 示例
 ```python
 from conch import Sandbox
-sandbox = Sandbox()
-result = sandbox.execute(cmd="python3",content="print('hello Conch！')")
-print(result)
-sandbox.delete()
+
+try:
+    sandbox = Sandbox.create()
+    print(f"Sandbox created: {sandbox.sandbox_id}")
+    result = sandbox.execute(cmd="python3", content="print('hello Conch!')")
+    print(result)
+except RuntimeError as e:
+    print(f"Error: {e}")
+finally:
+    sandbox.delete()
 ```
+
+调用 `execute()` 之前必须先成功执行 `Sandbox.create()` 类方法，并确保 `./bin/conchd` 已经启动；否则 `Sandbox` 实例还没有关联到可用的 Agent client。
 
 ## 许可证
 
@@ -66,4 +92,3 @@ sandbox.delete()
 ## 贡献指南
 
 欢迎社区贡献代码和文档。
-

@@ -1,7 +1,5 @@
 package common
 
-import "time"
-
 const (
 	DirMode  = 0750
 	FileMode = 0640
@@ -10,7 +8,6 @@ const (
 	SnapshotConfigFileName = "config.json"
 	MemKeySuffix           = "-mem"
 	VmKeySuffix            = "-vm"
-	TempViewPrefix         = "temp-view-"
 	MemMB                  = (1024 * 1024)
 	MemFileDefaultSize     = 256 // 256MB
 	VmInitrdRelativePath   = "data/conch.initrd"
@@ -18,9 +15,12 @@ const (
 	PmemPrefix             = "layer"
 	PemSuffix              = ".erofs"
 
-	ContainerdSock   = "/run/containerd/containerd.sock"
-	DefaultNamespace = "default"
-	RequestTimeout   = 60 * time.Second
+	ContainerdSock = "/run/containerd/containerd.sock"
+
+	SnapshotMountRootfs = "rootfs"
+	SnapshotMountMem    = "mem"
+	SnapshotMountVM     = "vm"
+	SnapshotSharedDir   = "shared"
 
 	ImageKindVirtualMachine = "virtual-machine"
 	ImageKindMemSnapshot    = "snapshot"

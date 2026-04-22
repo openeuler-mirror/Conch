@@ -1,21 +1,19 @@
 sandbox:
-  api_url: "http://localhost:4063"                # *Sandbox service API endpoint
-  workdir_prefix: "/tmp/sandbox_"                 # *Prefix for sandbox working directory
-  use_snapshot: false                             # *Whether to use snapshot for sandbox creation (default:false)
+  unix_socket: "/var/run/conchd/conchd.sock"      # Preferred: talk to conchd over local Unix socket
+  api_url: "http://localhost:4063"                # Fallback: used only when unix_socket is empty
   sandbox_id: ""                                  # Optional: sandbox ID (default:auto generate)
 
 snapshot:
   snapshot_id: ""                                 # Snapshot ID (default:auto generate)
   vmm_name: "cloud-hypervisor"                    # *Virtual machine monitor name
-  kernel_path: ""                                 # *Kernel binary path
-  disk_image_path: ""                             # *Raw disk image path
   vcpu_num: 1                                     # *Number of virtual CPUs
   ram_mb: 1024                                    # *Memory size in MB
 
 image:
-  image_name: ""                                  # *Image name
+  # For x86_64 architecture use: hub.oepkgs.net/conch/openeuler:odd-x86
+  # For aarch64 architecture use: hub.oepkgs.net/conch/openeuler:odd-aarch
+  image_name: "hub.oepkgs.net/conch/openeuler:odd-x86"
+  use_snapshot: false                              # When true, treat image_name as a snapshot-start image and use the snapshot startup path
   vmm_name: "cloud-hypervisor"                    # *Virtual machine monitor name
-  kernel_path: ""                                 # *Kernel binary path
-  disk_image_path: ""                             # *Raw disk image path
   vcpu_num: 1                                     # *Number of virtual CPUs
   ram_mb: 1024                                    # *Memory size in MB

@@ -1,7 +1,7 @@
+from .sandbox import Sandbox
 from .client import AgentClient
-from .conch import Sandbox
 
 __all__ = [
-    "AgentClient",
     "Sandbox",
+    "AgentClient",
 ]

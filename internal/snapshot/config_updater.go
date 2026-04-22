@@ -11,7 +11,7 @@ import (
 type configUpdater struct{}
 
 // updateSnapshotConfig updates the snapshot configuration file with new paths.
-func (cu *configUpdater) updateSnapshotConfig(configFilePath, kernelPath, initrdPath, memoryPath string, pmemPaths []string) error {
+func (cu *configUpdater) updateSnapshotConfig(configFilePath, kernelPath, initrdPath, memoryPath string, pmemPaths []string, cid uint32, socketPath string) error {
 	data, err := os.ReadFile(configFilePath)
 	if err != nil {
 		return fmt.Errorf("error open snapshot config file %s : %w", configFilePath, err)
@@ -25,7 +25,7 @@ func (cu *configUpdater) updateSnapshotConfig(configFilePath, kernelPath, initrd
 	cu.updatePayloadPaths(config, kernelPath, initrdPath)
 	cu.updateMemoryZone(config, memoryPath)
 	cu.updatePmemDevices(config, pmemPaths)
-
+	cu.updateVsockConfig(config, cid, socketPath)
 	updatedData, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
 		return fmt.Errorf("error marshal config: %w", err)
@@ -87,4 +87,17 @@ func (cu *configUpdater) updatePmemDevices(config map[string]interface{}, pmemPa
 	}
 	slog.Debug("update pmem", "paths", pmemPaths)
 	config["pmem"] = pmemArray
+}
+
+// updateVsockConfig updates the vsock configuration with new cid and socket path.
+func (cu *configUpdater) updateVsockConfig(config map[string]interface{}, cid uint32, socketPath string) {
+	if cid == 0 || socketPath == "" {
+		return
+	}
+	vsock, ok := config["vsock"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	vsock["cid"] = cid
+	vsock["socket"] = socketPath
 }

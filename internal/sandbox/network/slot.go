@@ -24,25 +24,31 @@ import (
 
 	"github.com/vishvananda/netlink"
 
+	"github.com/openeuler/Conch/pkg/ulog"
 	netutils "k8s.io/utils/net"
 )
 
 const (
-	defaultVrtNetworkCIDR = "10.12.0.0/24"
-	vrtMask               = 24
+	defaultVrtNetworkCIDR = "10.12.0.0/20"
+	defaultTapIP          = "192.168.100.2"
+	defaultTapMask        = 24
+	vrtMask               = 20
 	invaildSlotSize       = 0
 	vrtAddressPerSlot     = 1
-	tapInterfaceName      = "tap0"
-	tapIp                 = "192.168.100.2"
-	tapMask               = 24
-	loopbackInterface     = "lo"
+	// Index 1 is reserved for the bridge IP, so sandbox slots start from index 2.
+	firstSlotIndex    = 2
+	tapInterfaceName  = "tap0"
+	loopbackInterface = "lo"
+	namespaceIPIndex  = 21
 )
 
 var (
-	vrtNetworkCIDR  = GetVrtNetworkCIDR()
-	maxVrtSlotsSize = GetVrtSlotsSize()
-	bridgeIP        net.IP
-	once            sync.Once
+	vrtNetworkCIDR                   = GetVrtNetworkCIDR()
+	maxVrtSlotsSize, maxVrtSlotIndex = GetVrtSlotsSizeAndIndex()
+	bridgeIP                         net.IP
+	configuredTapIP                  = defaultTapIP
+	configuredTapMask                = defaultTapMask
+	once                             sync.Once
 )
 
 type Slot struct {
@@ -53,13 +59,14 @@ type Slot struct {
 	vrtMask  net.IPMask
 	bridgeIp net.IP
 
-	tapIp   net.IP
-	tapMask net.IPMask
+	tapIp       net.IP
+	tapMask     net.IPMask
+	namespaceIP net.IP
 }
 
 func NewSlot(key string, idx int) (*Slot, error) {
-	if idx < 1 || idx > maxVrtSlotsSize {
-		return nil, fmt.Errorf("slot index %d is out of range [1, %d)", idx, maxVrtSlotsSize)
+	if idx < firstSlotIndex || idx > maxVrtSlotIndex {
+		return nil, fmt.Errorf("slot index %d is out of range [%d, %d]", idx, firstSlotIndex, maxVrtSlotIndex)
 	}
 
 	if vrtNetworkCIDR == nil {
@@ -77,12 +84,17 @@ func NewSlot(key string, idx int) (*Slot, error) {
 		return nil, fmt.Errorf("failed to parse vrt CIDR: %w", err)
 	}
 
-	tapCIDR := fmt.Sprintf("%s/%d", tapIp, tapMask)
-	tapIp, tapNet, err := net.ParseCIDR(tapCIDR)
+	tapCIDR := fmt.Sprintf("%s/%d", configuredTapIP, configuredTapMask)
+	tapIP, tapNet, err := net.ParseCIDR(tapCIDR)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse tap CIDR: %w", err)
 	}
-	// Add bridge ip
+	namespaceIP, err := netutils.GetIndexedIP(tapNet, namespaceIPIndex)
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive namespace IP from tap CIDR: %w", err)
+	}
+	// The bridge uses the first usable IP (.0.1) in the subnet, so it is outside the
+	// allocatable sandbox slot range.
 	var err1 error
 	addBridgeAddr := func() {
 		bridgeIp, err := netutils.GetIndexedIP(vrtNetworkCIDR, vrtAddressPerSlot)
@@ -119,10 +131,33 @@ func NewSlot(key string, idx int) (*Slot, error) {
 		vrtMask:  vrtNet.Mask,
 		bridgeIp: bridgeIP,
 
-		tapIp:   tapIp,
-		tapMask: tapNet.Mask,
+		tapIp:       tapIP,
+		tapMask:     tapNet.Mask,
+		namespaceIP: namespaceIP,
 	}
 	return slot, nil
+}
+
+func configureTapNetwork(tapIP string, tapMask int) error {
+	if tapIP == "" {
+		tapIP = defaultTapIP
+	}
+	if tapMask == 0 {
+		tapMask = defaultTapMask
+	}
+
+	tapCIDR := fmt.Sprintf("%s/%d", tapIP, tapMask)
+	_, tapNet, err := net.ParseCIDR(tapCIDR)
+	if err != nil {
+		return fmt.Errorf("failed to parse tap CIDR %q: %w", tapCIDR, err)
+	}
+	if _, err := netutils.GetIndexedIP(tapNet, namespaceIPIndex); err != nil {
+		return fmt.Errorf("failed to derive namespace IP from tap CIDR %q: %w", tapCIDR, err)
+	}
+
+	configuredTapIP = tapIP
+	configuredTapMask = tapMask
+	return nil
 }
 
 func (s *Slot) NamespaceID() string {
@@ -158,7 +193,7 @@ func (s *Slot) VrtMask() net.IPMask {
 }
 
 func (s *Slot) TapName() string {
-	return "tap0"
+	return tapInterfaceName
 }
 
 func (s *Slot) TapIP() net.IP {
@@ -170,7 +205,7 @@ func (s *Slot) TapCIDR() net.IPMask {
 }
 
 func (s *Slot) NamespaceIP() string {
-	return "192.168.100.21"
+	return s.namespaceIP.String()
 }
 
 func (s *Slot) VrtNetworkCIDRString() string {
@@ -191,16 +226,28 @@ func GetVrtNetworkCIDR() *net.IPNet {
 	return vrtIp
 }
 
-func GetVrtSlotsSize() int {
+func GetVrtSlotsSizeAndIndex() (slotCount int, maxSlotIndex int) {
 	vrtIp, err := getVrtNetworkCIDR()
 	if err != nil {
 		fmt.Errorf("failed to get vrtNetworkAddr, err is %v", err)
-		return invaildSlotSize
+		return invaildSlotSize, invaildSlotSize
 	}
 	ones, _ := vrtIp.Mask.Size()
+	// For IPv4, a /20 means 32-20 host bits, so this computes the total number
+	// of addresses present in the configured subnet.
 	totalIPs := 1 << (32 - ones)
-	totalSlots := (totalIPs / vrtAddressPerSlot) - vrtAddressPerSlot
 
-	fmt.Printf("Using network slot size: %d\n", totalSlots)
-	return totalSlots
+	// Reserve three addresses from the raw subnet capacity:
+	// 1. subnet base address (.0) is not assignable
+	// 2. index 1 is reserved for the bridge IP
+	// 3. subnet broadcast address (.15.255) is not assignable
+	slotCount = (totalIPs / vrtAddressPerSlot) - vrtAddressPerSlot - 2
+	// The largest usable slot index stops before the broadcast address.
+	maxSlotIndex = totalIPs - 2
+
+	if slotCount < 0 || maxSlotIndex < firstSlotIndex {
+		return invaildSlotSize, invaildSlotSize
+	}
+	getLogger().Info("Using network slot size", ulog.F("total_slots", slotCount), ulog.F("max_slot_index", maxSlotIndex))
+	return slotCount, maxSlotIndex
 }
