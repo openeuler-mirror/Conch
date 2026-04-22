@@ -10,6 +10,7 @@ import (
 
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/snapshots"
+	"github.com/containerd/errdefs"
 	"golang.org/x/sys/unix"
 
 	"github.com/openeuler/Conch/internal/daemon"
@@ -43,6 +44,94 @@ func NewServer(workDir string, daemonClient *daemon.Client) error {
 	}
 
 	return nil
+}
+
+func (s *server) List(req ListRequest) ([]SnapshotInfo, error) {
+	ctx := context.Background()
+	namespaces := make([]string, 0, 1)
+	if req.Namespace != "" {
+		namespaces = append(namespaces, req.Namespace)
+	} else {
+		listed, err := s.snt.ListNamespaces(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list namespaces: %w", err)
+		}
+		namespaces = append(namespaces, listed...)
+	}
+
+	items := make([]SnapshotInfo, 0)
+	for _, namespace := range namespaces {
+		result := make(map[string]*snapshots.Info)
+		if err := s.snt.List(ctx, namespace, result); err != nil {
+			return nil, fmt.Errorf("list snapshots in namespace %s: %w", namespace, err)
+		}
+
+		for snapshotID, info := range result {
+			if !isCommittedUserSnapshot(info) {
+				continue
+			}
+			items = append(items, SnapshotInfo{
+				Namespace:  namespace,
+				SnapshotId: snapshotID,
+			})
+		}
+	}
+
+	sortSnapshotInfos(items)
+	return items, nil
+}
+
+func (s *server) Get(req GetRequest) (*SnapshotInfo, error) {
+	if req.SnapshotId == "" {
+		return nil, fmt.Errorf("snapshot_id is required")
+	}
+
+	ctx := context.Background()
+	namespaces := make([]string, 0, 1)
+	if req.Namespace != "" {
+		namespaces = append(namespaces, req.Namespace)
+	} else {
+		listed, err := s.snt.ListNamespaces(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list namespaces: %w", err)
+		}
+		namespaces = append(namespaces, listed...)
+	}
+
+	for _, namespace := range namespaces {
+		info, err := s.snt.Stat(ctx, namespace, req.SnapshotId)
+		if err != nil {
+			if errdefs.IsNotFound(err) {
+				continue
+			}
+			return nil, fmt.Errorf("stat snapshot %s in namespace %s: %w", req.SnapshotId, namespace, err)
+		}
+		if !isCommittedUserSnapshot(&info) {
+			continue
+		}
+		return &SnapshotInfo{
+			Namespace:  namespace,
+			SnapshotId: req.SnapshotId,
+		}, nil
+	}
+
+	return nil, fmt.Errorf("%w: %s", ErrSnapshotNotFound, req.SnapshotId)
+}
+
+func isCommittedUserSnapshot(info *snapshots.Info) bool {
+	if info == nil || info.Kind != snapshots.KindCommitted || info.Labels == nil {
+		return false
+	}
+	if info.Labels[common.SnapshotLabel] != "true" {
+		return false
+	}
+	if info.Labels[common.SnapshotLabelMemSnapshot] == "" {
+		return false
+	}
+	if info.Labels[common.SnapshotLabelVMSnapshot] == "" {
+		return false
+	}
+	return true
 }
 
 // getActiveSnapshot retrieves runtime active snapshot info from cache.
@@ -435,7 +524,7 @@ func (s *server) Commit(ctx context.Context, namespace, snapshotID, key string, 
 
 	configUpdater := &configUpdater{}
 	configFilePath := filepath.Join(conf.SnapDir(), common.SnapshotConfigFileName)
-	if err := configUpdater.updateSnapshotConfig(configFilePath, viewConf.KernelFile(), viewConf.InitrdFile(), viewConf.SnapshotMemFile(), viewConf.PmemFiles(),0,""); err != nil {
+	if err := configUpdater.updateSnapshotConfig(configFilePath, viewConf.KernelFile(), viewConf.InitrdFile(), viewConf.SnapshotMemFile(), viewConf.PmemFiles(), 0, ""); err != nil {
 		return fmt.Errorf("update snapshot config failed: %v", err)
 	}
 

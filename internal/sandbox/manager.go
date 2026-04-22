@@ -2,8 +2,10 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -57,6 +59,24 @@ type SandboxPauseRequest struct {
 	Namespace string `json:"namespace"`
 	SandboxId string `json:"sandbox_id"`
 }
+
+type SandboxListRequest struct {
+	Namespace string `json:"namespace"`
+}
+
+type SandboxGetRequest struct {
+	Namespace string `json:"namespace"`
+	SandboxId string `json:"sandbox_id"`
+}
+
+type SandboxRuntimeInfo struct {
+	Namespace string `json:"namespace"`
+	SandboxId string `json:"sandbox_id"`
+	IP        string `json:"ip"`
+	Running   bool   `json:"running"`
+}
+
+var ErrSandboxNotFound = errors.New("sandbox not found")
 
 const (
 	vsockReadyPort       = 4065
@@ -445,4 +465,70 @@ func (m *Manager) ReleaseCID(sandboxId string) error {
 
 func (m *Manager) CleanupCIDMap() error {
 	return m.cidAllocator.Cleanup()
+}
+
+func (m *Manager) List(req SandboxListRequest) ([]SandboxRuntimeInfo, error) {
+	namespace := m.resolveNamespace(req.Namespace)
+	infos := make([]SandboxRuntimeInfo, 0)
+
+	m.sandboxes.Range(func(key, value any) bool {
+		mapKey, ok := key.(string)
+		if !ok {
+			return true
+		}
+
+		sbx, ok := value.(*Sandbox)
+		if !ok {
+			return true
+		}
+
+		entryNamespace, sandboxID, ok := strings.Cut(mapKey, ":")
+		if !ok || entryNamespace != namespace {
+			return true
+		}
+
+		infos = append(infos, newSandboxRuntimeInfo(entryNamespace, sandboxID, sbx))
+		return true
+	})
+
+	sort.Slice(infos, func(i, j int) bool {
+		return infos[i].SandboxId < infos[j].SandboxId
+	})
+
+	return infos, nil
+}
+
+func (m *Manager) Get(req SandboxGetRequest) (*SandboxRuntimeInfo, error) {
+	if req.SandboxId == "" {
+		return nil, fmt.Errorf("sandbox_id is required")
+	}
+
+	namespace := m.resolveNamespace(req.Namespace)
+	mapKey := sandboxMapKey(namespace, req.SandboxId)
+	sbxVal, exists := m.sandboxes.Load(mapKey)
+	if !exists {
+		return nil, fmt.Errorf("%w: %s", ErrSandboxNotFound, req.SandboxId)
+	}
+
+	sbx, ok := sbxVal.(*Sandbox)
+	if !ok {
+		return nil, fmt.Errorf("invalid sandbox type for %s", req.SandboxId)
+	}
+
+	info := newSandboxRuntimeInfo(namespace, req.SandboxId, sbx)
+	return &info, nil
+}
+
+func newSandboxRuntimeInfo(namespace, sandboxID string, sbx *Sandbox) SandboxRuntimeInfo {
+	ip := ""
+	if sbx != nil && sbx.slot != nil {
+		ip = sbx.slot.VpeerIPString()
+	}
+
+	return SandboxRuntimeInfo{
+		Namespace: namespace,
+		SandboxId: sandboxID,
+		IP:        ip,
+		Running:   true,
+	}
 }

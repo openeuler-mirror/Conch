@@ -3,6 +3,7 @@ package internal
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -30,6 +31,8 @@ const (
 type Server struct {
 	router         *http.ServeMux
 	sandboxManager sandboxManager
+	listSnapshots  func(req snapshot.ListRequest) ([]snapshot.SnapshotInfo, error)
+	getSnapshot    func(req snapshot.GetRequest) (*snapshot.SnapshotInfo, error)
 	daemonClient   *daemon.Client
 	httpServer     *http.Server
 	listener       net.Listener
@@ -43,6 +46,32 @@ type sandboxManager interface {
 	Create(req sandbox.SandboxCreateRequest) (string, error)
 	Delete(req sandbox.SandboxDeleteRequest) error
 	Pause(req sandbox.SandboxPauseRequest) (string, error)
+	List(req sandbox.SandboxListRequest) ([]sandbox.SandboxRuntimeInfo, error)
+	Get(req sandbox.SandboxGetRequest) (*sandbox.SandboxRuntimeInfo, error)
+}
+
+type sandboxListResponse struct {
+	Status    string                       `json:"status"`
+	Count     int                          `json:"count"`
+	Sandboxes []sandbox.SandboxRuntimeInfo `json:"sandboxes"`
+}
+
+type sandboxGetResponse struct {
+	Status  string                      `json:"status"`
+	Exists  bool                        `json:"exists"`
+	Sandbox *sandbox.SandboxRuntimeInfo `json:"sandbox,omitempty"`
+}
+
+type snapshotListResponse struct {
+	Status    string                  `json:"status"`
+	Count     int                     `json:"count"`
+	Snapshots []snapshot.SnapshotInfo `json:"snapshots"`
+}
+
+type snapshotGetResponse struct {
+	Status   string                 `json:"status"`
+	Exists   bool                   `json:"exists"`
+	Snapshot *snapshot.SnapshotInfo `json:"snapshot,omitempty"`
 }
 
 func handleSignals(ctx context.Context, cancel context.CancelFunc, s *Server) {
@@ -84,7 +113,9 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	s := &Server{
-		router: http.NewServeMux(),
+		router:        http.NewServeMux(),
+		listSnapshots: snapshot.List,
+		getSnapshot:   snapshot.Get,
 	}
 	s.routes()
 
@@ -133,12 +164,23 @@ func (s *Server) SetSandboxManager(manager sandboxManager) {
 	s.sandboxManager = manager
 }
 
+func (s *Server) SetSnapshotLister(listFn func(req snapshot.ListRequest) ([]snapshot.SnapshotInfo, error)) {
+	s.listSnapshots = listFn
+}
+
+func (s *Server) SetSnapshotGetter(getFn func(req snapshot.GetRequest) (*snapshot.SnapshotInfo, error)) {
+	s.getSnapshot = getFn
+}
+
 func (s *Server) routes() {
 	// sandbox
 	s.router.HandleFunc("/api/sandbox/create", s.handleCreateSandbox)
 	s.router.HandleFunc("/api/sandbox/delete", s.handleDeleteSandbox)
 	s.router.HandleFunc("/api/sandbox/pause", s.handlePauseSandbox)
+	s.router.HandleFunc("/api/sandbox/list", s.handleListSandboxes)
+	s.router.HandleFunc("/api/sandbox/get", s.handleGetSandbox)
 	s.router.HandleFunc("/api/snapshot/list", s.handleListSnapshot)
+	s.router.HandleFunc("/api/snapshot/get", s.handleGetSnapshot)
 }
 
 func (s *Server) Start(addr string, unixSocket string) error {
@@ -340,5 +382,158 @@ func (s *Server) handlePauseSandbox(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// TODO return available snapshot_id
-func (s *Server) handleListSnapshot(w http.ResponseWriter, r *http.Request) {}
+func (s *Server) handleListSandboxes(w http.ResponseWriter, r *http.Request) {
+	logger := ulog.GetLogger()
+	logger.Debug("Handling list sandboxes request")
+
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	infos, err := s.sandboxManager.List(sandbox.SandboxListRequest{
+		Namespace: r.URL.Query().Get("namespace"),
+	})
+	if err != nil {
+		logger.Error("Failed to list sandboxes", ulog.F("error", err))
+		http.Error(w, "Failed to list sandboxes", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(sandboxListResponse{
+		Status:    "ok",
+		Count:     len(infos),
+		Sandboxes: infos,
+	})
+}
+
+func (s *Server) handleGetSandbox(w http.ResponseWriter, r *http.Request) {
+	logger := ulog.GetLogger()
+	logger.Debug("Handling get sandbox request")
+
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	sandboxID := r.URL.Query().Get("sandbox_id")
+	if sandboxID == "" {
+		http.Error(w, "sandbox_id is required", http.StatusBadRequest)
+		return
+	}
+
+	info, err := s.sandboxManager.Get(sandbox.SandboxGetRequest{
+		Namespace: r.URL.Query().Get("namespace"),
+		SandboxId: sandboxID,
+	})
+	if err != nil {
+		if errors.Is(err, sandbox.ErrSandboxNotFound) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(sandboxGetResponse{
+				Status: "not_found",
+				Exists: false,
+			})
+			return
+		}
+
+		logger.Error("Failed to get sandbox",
+			ulog.F("sandbox_id", sandboxID),
+			ulog.F("error", err),
+		)
+		http.Error(w, "Failed to get sandbox", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(sandboxGetResponse{
+		Status:  "ok",
+		Exists:  true,
+		Sandbox: info,
+	})
+}
+
+func (s *Server) handleListSnapshot(w http.ResponseWriter, r *http.Request) {
+	logger := ulog.GetLogger()
+	logger.Debug("Handling list snapshot request")
+
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.listSnapshots == nil {
+		logger.Error("Snapshot lister is not configured")
+		http.Error(w, "Failed to list snapshots", http.StatusInternalServerError)
+		return
+	}
+
+	items, err := s.listSnapshots(snapshot.ListRequest{
+		Namespace: r.URL.Query().Get("namespace"),
+	})
+	if err != nil {
+		logger.Error("Failed to list snapshots", ulog.F("error", err))
+		http.Error(w, "Failed to list snapshots", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(snapshotListResponse{
+		Status:    "ok",
+		Count:     len(items),
+		Snapshots: items,
+	})
+}
+
+func (s *Server) handleGetSnapshot(w http.ResponseWriter, r *http.Request) {
+	logger := ulog.GetLogger()
+	logger.Debug("Handling get snapshot request")
+
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	snapshotID := r.URL.Query().Get("snapshot_id")
+	if snapshotID == "" {
+		http.Error(w, "snapshot_id is required", http.StatusBadRequest)
+		return
+	}
+
+	if s.getSnapshot == nil {
+		logger.Error("Snapshot getter is not configured")
+		http.Error(w, "Failed to get snapshot", http.StatusInternalServerError)
+		return
+	}
+
+	item, err := s.getSnapshot(snapshot.GetRequest{
+		Namespace:  r.URL.Query().Get("namespace"),
+		SnapshotId: snapshotID,
+	})
+	if err != nil {
+		if errors.Is(err, snapshot.ErrSnapshotNotFound) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(snapshotGetResponse{
+				Status: "not_found",
+				Exists: false,
+			})
+			return
+		}
+
+		logger.Error("Failed to get snapshot",
+			ulog.F("snapshot_id", snapshotID),
+			ulog.F("error", err),
+		)
+		http.Error(w, "Failed to get snapshot", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(snapshotGetResponse{
+		Status:   "ok",
+		Exists:   true,
+		Snapshot: item,
+	})
+}
