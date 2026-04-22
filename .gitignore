@@ -43,3 +43,8 @@ api/py_proto/
 # python
 __pycache__
 *.pyc
+
+**/conch.egg-info/
+local/
+
+ sdk/
