@@ -33,6 +33,7 @@ type Server struct {
 	sandboxManager sandboxManager
 	listSnapshots  func(req snapshot.ListRequest) ([]snapshot.SnapshotInfo, error)
 	getSnapshot    func(req snapshot.GetRequest) (*snapshot.SnapshotInfo, error)
+	deleteSnapshot func(req snapshot.DeleteRequest) (*snapshot.DeleteResult, error)
 	daemonClient   *daemon.Client
 	httpServer     *http.Server
 	listener       net.Listener
@@ -74,6 +75,14 @@ type snapshotGetResponse struct {
 	Snapshot *snapshot.SnapshotInfo `json:"snapshot,omitempty"`
 }
 
+type snapshotDeleteResponse struct {
+	Status        string `json:"status"`
+	Deleted       bool   `json:"deleted,omitempty"`
+	Exists        bool   `json:"exists,omitempty"`
+	SnapshotId    string `json:"snapshot_id,omitempty"`
+	MemSnapshotId string `json:"mem_snapshot_id,omitempty"`
+}
+
 func handleSignals(ctx context.Context, cancel context.CancelFunc, s *Server) {
 	go func() {
 		var sig os.Signal
@@ -113,9 +122,10 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	s := &Server{
-		router:        http.NewServeMux(),
-		listSnapshots: snapshot.List,
-		getSnapshot:   snapshot.Get,
+		router:         http.NewServeMux(),
+		listSnapshots:  snapshot.List,
+		getSnapshot:    snapshot.Get,
+		deleteSnapshot: snapshot.DeleteCommitted,
 	}
 	s.routes()
 
@@ -172,6 +182,10 @@ func (s *Server) SetSnapshotGetter(getFn func(req snapshot.GetRequest) (*snapsho
 	s.getSnapshot = getFn
 }
 
+func (s *Server) SetSnapshotDeleter(deleteFn func(req snapshot.DeleteRequest) (*snapshot.DeleteResult, error)) {
+	s.deleteSnapshot = deleteFn
+}
+
 func (s *Server) routes() {
 	// sandbox
 	s.router.HandleFunc("/api/sandbox/create", s.handleCreateSandbox)
@@ -181,6 +195,7 @@ func (s *Server) routes() {
 	s.router.HandleFunc("/api/sandbox/get", s.handleGetSandbox)
 	s.router.HandleFunc("/api/snapshot/list", s.handleListSnapshot)
 	s.router.HandleFunc("/api/snapshot/get", s.handleGetSnapshot)
+	s.router.HandleFunc("/api/snapshot/delete", s.handleDeleteSnapshot)
 }
 
 func (s *Server) Start(addr string, unixSocket string) error {
@@ -535,5 +550,71 @@ func (s *Server) handleGetSnapshot(w http.ResponseWriter, r *http.Request) {
 		Status:   "ok",
 		Exists:   true,
 		Snapshot: item,
+	})
+}
+
+func (s *Server) handleDeleteSnapshot(w http.ResponseWriter, r *http.Request) {
+	logger := ulog.GetLogger()
+	logger.Debug("Handling delete snapshot request")
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.deleteSnapshot == nil {
+		logger.Error("Snapshot deleter is not configured")
+		http.Error(w, "Failed to delete snapshot", http.StatusInternalServerError)
+		return
+	}
+
+	var req snapshot.DeleteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		logger.Warn("Invalid request body", ulog.F("error", err))
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.SnapshotId == "" {
+		http.Error(w, "snapshot_id is required", http.StatusBadRequest)
+		return
+	}
+
+	result, err := s.deleteSnapshot(req)
+	if err != nil {
+		switch {
+		case errors.Is(err, snapshot.ErrSnapshotNotFound):
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(snapshotDeleteResponse{
+				Status: "not_found",
+				Exists: false,
+			})
+			return
+		case errors.Is(err, snapshot.ErrSnapshotInUse):
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(snapshotDeleteResponse{Status: "in_use"})
+			return
+		case errors.Is(err, snapshot.ErrSnapshotNotDeletable):
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(snapshotDeleteResponse{Status: "not_deletable"})
+			return
+		default:
+			logger.Error("Failed to delete snapshot",
+				ulog.F("snapshot_id", req.SnapshotId),
+				ulog.F("error", err),
+			)
+			http.Error(w, "Failed to delete snapshot", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(snapshotDeleteResponse{
+		Status:        "ok",
+		Deleted:       true,
+		SnapshotId:    result.SnapshotId,
+		MemSnapshotId: result.MemSnapshotId,
 	})
 }

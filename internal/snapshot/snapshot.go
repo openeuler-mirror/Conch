@@ -100,12 +100,25 @@ type GetRequest struct {
 	SnapshotId string `json:"snapshot_id"`
 }
 
+type DeleteRequest struct {
+	Namespace  string `json:"namespace"`
+	SnapshotId string `json:"snapshot_id"`
+}
+
 type SnapshotInfo struct {
 	Namespace  string `json:"namespace"`
 	SnapshotId string `json:"snapshot_id"`
 }
 
+type DeleteResult struct {
+	Namespace     string `json:"namespace"`
+	SnapshotId    string `json:"snapshot_id"`
+	MemSnapshotId string `json:"mem_snapshot_id,omitempty"`
+}
+
 var ErrSnapshotNotFound = errors.New("snapshot not found")
+var ErrSnapshotInUse = errors.New("snapshot in use")
+var ErrSnapshotNotDeletable = errors.New("snapshot not deletable")
 
 // Prepare creates 3 new active snapshots for image-based startup.
 func Prepare(ctx context.Context, namespace, key string, parents ParentSnapshotIDs, opts ...Opt) (*SnapshotConfig, error) {
@@ -177,6 +190,13 @@ func Get(req GetRequest) (*SnapshotInfo, error) {
 		return nil, fmt.Errorf("server not init")
 	}
 	return gServer.Get(req)
+}
+
+func DeleteCommitted(req DeleteRequest) (*DeleteResult, error) {
+	if gServer.snt == nil {
+		return nil, fmt.Errorf("server not init")
+	}
+	return gServer.DeleteCommitted(req)
 }
 
 func sortSnapshotInfos(items []SnapshotInfo) {

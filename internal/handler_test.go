@@ -52,6 +52,9 @@ func newTestServer(manager sandboxManager) *Server {
 	s.SetSnapshotGetter(func(req snapshot.GetRequest) (*snapshot.SnapshotInfo, error) {
 		return nil, fmt.Errorf("%w: %s", snapshot.ErrSnapshotNotFound, req.SnapshotId)
 	})
+	s.SetSnapshotDeleter(func(req snapshot.DeleteRequest) (*snapshot.DeleteResult, error) {
+		return nil, fmt.Errorf("%w: %s", snapshot.ErrSnapshotNotFound, req.SnapshotId)
+	})
 	s.routes()
 	return s
 }
@@ -381,6 +384,139 @@ func TestHandleGetSnapshotHidesInternalErrors(t *testing.T) {
 		t.Fatalf("expected internal error details to be hidden, got body %s", body)
 	}
 	if !strings.Contains(body, "Failed to get snapshot") {
+		t.Fatalf("expected generic error message, got body %s", body)
+	}
+}
+
+func TestHandleDeleteSnapshotReturnsSuccess(t *testing.T) {
+	s := newTestServer(&fakeSandboxManager{})
+	s.SetSnapshotDeleter(func(req snapshot.DeleteRequest) (*snapshot.DeleteResult, error) {
+		return &snapshot.DeleteResult{
+			Namespace:     "default",
+			SnapshotId:    req.SnapshotId,
+			MemSnapshotId: "mem-1",
+		}, nil
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/snapshot/delete", strings.NewReader(`{"snapshot_id":"snap-1"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	s.router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, rr.Code)
+	}
+
+	var resp snapshotDeleteResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp.Status != "ok" || !resp.Deleted {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+	if resp.SnapshotId != "snap-1" || resp.MemSnapshotId != "mem-1" {
+		t.Fatalf("unexpected delete payload: %+v", resp)
+	}
+}
+
+func TestHandleDeleteSnapshotReturnsNotFound(t *testing.T) {
+	s := newTestServer(&fakeSandboxManager{})
+	s.SetSnapshotDeleter(func(req snapshot.DeleteRequest) (*snapshot.DeleteResult, error) {
+		return nil, fmt.Errorf("%w: %s", snapshot.ErrSnapshotNotFound, req.SnapshotId)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/snapshot/delete", strings.NewReader(`{"snapshot_id":"missing"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	s.router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected status %d, got %d", http.StatusNotFound, rr.Code)
+	}
+
+	var resp snapshotDeleteResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp.Status != "not_found" || resp.Exists {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+}
+
+func TestHandleDeleteSnapshotReturnsConflictStates(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected string
+	}{
+		{name: "in use", err: fmt.Errorf("%w: snap-1", snapshot.ErrSnapshotInUse), expected: "in_use"},
+		{name: "not deletable", err: fmt.Errorf("%w: snap-1", snapshot.ErrSnapshotNotDeletable), expected: "not_deletable"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestServer(&fakeSandboxManager{})
+			s.SetSnapshotDeleter(func(req snapshot.DeleteRequest) (*snapshot.DeleteResult, error) {
+				return nil, tt.err
+			})
+
+			req := httptest.NewRequest(http.MethodPost, "/api/snapshot/delete", strings.NewReader(`{"snapshot_id":"snap-1"}`))
+			req.Header.Set("Content-Type", "application/json")
+			rr := httptest.NewRecorder()
+
+			s.router.ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusConflict {
+				t.Fatalf("expected status %d, got %d", http.StatusConflict, rr.Code)
+			}
+
+			var resp snapshotDeleteResponse
+			if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("failed to decode response: %v", err)
+			}
+			if resp.Status != tt.expected {
+				t.Fatalf("expected status %q, got %+v", tt.expected, resp)
+			}
+		})
+	}
+}
+
+func TestHandleDeleteSnapshotRequiresSnapshotID(t *testing.T) {
+	s := newTestServer(&fakeSandboxManager{})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/snapshot/delete", strings.NewReader(`{"namespace":"default"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	s.router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, rr.Code)
+	}
+}
+
+func TestHandleDeleteSnapshotHidesInternalErrors(t *testing.T) {
+	s := newTestServer(&fakeSandboxManager{})
+	s.SetSnapshotDeleter(func(req snapshot.DeleteRequest) (*snapshot.DeleteResult, error) {
+		return nil, fmt.Errorf("secret internal snapshot delete failure")
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/snapshot/delete", strings.NewReader(`{"snapshot_id":"snap-1"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	s.router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("expected status %d, got %d", http.StatusInternalServerError, rr.Code)
+	}
+	body := rr.Body.String()
+	if strings.Contains(body, "secret internal snapshot delete failure") {
+		t.Fatalf("expected internal error details to be hidden, got body %s", body)
+	}
+	if !strings.Contains(body, "Failed to delete snapshot") {
 		t.Fatalf("expected generic error message, got body %s", body)
 	}
 }
