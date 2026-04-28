@@ -26,8 +26,9 @@ type SnapshotConfig struct {
 	MemDir string // dir which mount mem overlayfs
 	VmDir  string // dir which mount vm snapshot overlayfs
 
-	RootDir string // dir which save vm snapshot (inside MemDir)
-	MemSize int64  // memory size of vm, unit is mb
+	RootDir          string // dir which save vm snapshot (inside MemDir)
+	NextSnapshotRoot string
+	MemSize          int64 // memory size of vm, unit is mb
 
 	pmemFiles []string // pmem array (e.g. layer1.erofs, layer2.erofs, layer3.erofs)
 
@@ -55,7 +56,22 @@ func (c *SnapshotConfig) KernelFile() string {
 }
 
 func (c *SnapshotConfig) SnapDir() string {
+	rootDir := c.RootDir
+	if c.NextSnapshotRoot != "" {
+		rootDir = c.NextSnapshotRoot
+	}
+	return filepath.Join(c.MemDir, rootDir)
+}
+
+func (c *SnapshotConfig) CurrentSnapshotDir() string {
 	return filepath.Join(c.MemDir, c.RootDir)
+}
+
+func (c *SnapshotConfig) LabelSnapshotRoot() string {
+	if c.NextSnapshotRoot != "" {
+		return c.NextSnapshotRoot
+	}
+	return c.RootDir
 }
 
 // initDefaults sets default values for SnapshotConfig fields.
@@ -65,6 +81,9 @@ func (c *SnapshotConfig) initDefaults() {
 	}
 	if c.RootDir == "" {
 		c.RootDir = "/conch/snapshot"
+	}
+	if c.NextSnapshotRoot == "" {
+		c.NextSnapshotRoot = c.RootDir
 	}
 	if c.pmemFiles == nil {
 		c.pmemFiles = make([]string, 0)
@@ -79,10 +98,17 @@ func (c *SnapshotConfig) createLabels() {
 	c.Labels[common.SnapshotLabel] = "true"
 	c.Labels[common.SnapshotLabelMemSize] = fmt.Sprintf("%d", c.MemSize)
 	c.Labels[common.SnapshotLabelRootfs] = c.Rootfs
-	c.Labels[common.SnapshotLabelSnapshotDir] = c.RootDir
+	c.Labels[common.SnapshotLabelSnapshotDir] = c.LabelSnapshotRoot()
 }
 
 type Opt func(info *SnapshotConfig) error
+
+func WithNextSnapshotRoot(root string) Opt {
+	return func(info *SnapshotConfig) error {
+		info.NextSnapshotRoot = root
+		return nil
+	}
+}
 
 // ParentSnapshotIDs groups parent snapshot IDs for image-based startup.
 type ParentSnapshotIDs struct {
@@ -138,8 +164,8 @@ func AcquireView(ctx context.Context, namespace, key string, parents ParentSnaps
 }
 
 // AcquireResumeWorkspace prepares a snapshot-based restore workspace.
-// Rootfs and VM are mounted as shared views, while mem is mounted as an active
-// layer so the snapshot config can be updated before restore.
+// Rootfs and mem are mounted as active layers so a resumed sandbox can be
+// committed again later, while VM remains a shared view.
 func AcquireResumeWorkspace(ctx context.Context, namespace, key string, parents ParentSnapshotIDs, cid uint32, socketPath string, opts ...Opt) (*SnapshotConfig, error) {
 	if gServer.snt == nil {
 		return nil, fmt.Errorf("server not init")

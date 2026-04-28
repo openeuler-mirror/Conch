@@ -178,6 +178,13 @@ func getSharedViewSnapshotKey(mountKind, snapshotID string) string {
 	return fmt.Sprintf("shared-%s-%s", mountKind, snapshotPathName(snapshotID))
 }
 
+// nextSnapshotRootDir returns a unique output directory for the next VM snapshot.
+// It uses the snapshotID (not sandboxID) to avoid directory collisions when
+// the same sandbox_id is reused across snapshot generations.
+func nextSnapshotRootDir(snapshotID string) string {
+	return filepath.Join("conch", "snapshot", snapshotPathName(snapshotID))
+}
+
 // cleanupEmptySnapshotParents removes empty parent directories after a mount point
 // directory has been deleted. It only prunes within the snapshot tree and stops
 // at the "snapshot" root directory.
@@ -219,6 +226,7 @@ func mergeLabels(info *snapshots.Info, conf *SnapshotConfig) {
 			conf.Rootfs = v
 		case common.SnapshotLabelSnapshotDir:
 			conf.RootDir = v
+			conf.NextSnapshotRoot = v
 		default:
 			conf.Labels[k] = v
 		}
