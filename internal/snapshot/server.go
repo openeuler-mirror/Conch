@@ -10,6 +10,7 @@ import (
 
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/snapshots"
+	"github.com/containerd/errdefs"
 	"golang.org/x/sys/unix"
 
 	"github.com/openeuler/Conch/internal/daemon"
@@ -43,6 +44,306 @@ func NewServer(workDir string, daemonClient *daemon.Client) error {
 	}
 
 	return nil
+}
+
+func (s *server) List(req ListRequest) ([]SnapshotInfo, error) {
+	ctx := context.Background()
+	namespaces := make([]string, 0, 1)
+	if req.Namespace != "" {
+		namespaces = append(namespaces, req.Namespace)
+	} else {
+		listed, err := s.snt.ListNamespaces(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list namespaces: %w", err)
+		}
+		namespaces = append(namespaces, listed...)
+	}
+
+	items := make([]SnapshotInfo, 0)
+	for _, namespace := range namespaces {
+		result := make(map[string]*snapshots.Info)
+		if err := s.snt.List(ctx, namespace, result); err != nil {
+			return nil, fmt.Errorf("list snapshots in namespace %s: %w", namespace, err)
+		}
+
+		for snapshotID, info := range result {
+			if !isCommittedUserSnapshot(info) {
+				continue
+			}
+			items = append(items, SnapshotInfo{
+				Namespace:  namespace,
+				SnapshotId: snapshotID,
+			})
+		}
+	}
+
+	sortSnapshotInfos(items)
+	return items, nil
+}
+
+func (s *server) Get(req GetRequest) (*SnapshotInfo, error) {
+	if req.SnapshotId == "" {
+		return nil, fmt.Errorf("snapshot_id is required")
+	}
+
+	ctx := context.Background()
+	namespaces := make([]string, 0, 1)
+	if req.Namespace != "" {
+		namespaces = append(namespaces, req.Namespace)
+	} else {
+		listed, err := s.snt.ListNamespaces(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list namespaces: %w", err)
+		}
+		namespaces = append(namespaces, listed...)
+	}
+
+	for _, namespace := range namespaces {
+		info, err := s.snt.Stat(ctx, namespace, req.SnapshotId)
+		if err != nil {
+			if errdefs.IsNotFound(err) {
+				continue
+			}
+			return nil, fmt.Errorf("stat snapshot %s in namespace %s: %w", req.SnapshotId, namespace, err)
+		}
+		if !isCommittedUserSnapshot(&info) {
+			continue
+		}
+		return &SnapshotInfo{
+			Namespace:  namespace,
+			SnapshotId: req.SnapshotId,
+		}, nil
+	}
+
+	return nil, fmt.Errorf("%w: %s", ErrSnapshotNotFound, req.SnapshotId)
+}
+
+func (s *server) DeleteCommitted(req DeleteRequest) (*DeleteResult, error) {
+	if req.SnapshotId == "" {
+		return nil, fmt.Errorf("snapshot_id is required")
+	}
+
+	ctx := context.Background()
+	namespaces := make([]string, 0, 1)
+	if req.Namespace != "" {
+		namespaces = append(namespaces, req.Namespace)
+	} else {
+		listed, err := s.snt.ListNamespaces(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list namespaces: %w", err)
+		}
+		namespaces = append(namespaces, listed...)
+	}
+
+	for _, namespace := range namespaces {
+		result, err := s.deleteCommittedInNamespace(ctx, namespace, req.SnapshotId)
+		if err == nil {
+			return result, nil
+		}
+		if errors.Is(err, ErrSnapshotNotFound) {
+			continue
+		}
+		return nil, err
+	}
+
+	return nil, fmt.Errorf("%w: %s", ErrSnapshotNotFound, req.SnapshotId)
+}
+
+func (s *server) deleteCommittedInNamespace(ctx context.Context, namespace, snapshotID string) (*DeleteResult, error) {
+	info, err := s.snt.Stat(ctx, namespace, snapshotID)
+	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return nil, fmt.Errorf("%w: %s", ErrSnapshotNotFound, snapshotID)
+		}
+		return nil, fmt.Errorf("stat snapshot %s in namespace %s: %w", snapshotID, namespace, err)
+	}
+	if !isCommittedUserSnapshot(&info) {
+		return nil, fmt.Errorf("%w: %s", ErrSnapshotNotDeletable, snapshotID)
+	}
+
+	memSnapshotID := info.Labels[common.SnapshotLabelMemSnapshot]
+	validatedMemSnapshotID, err := s.validateCommittedMemSnapshot(ctx, namespace, snapshotID, memSnapshotID)
+	if err != nil {
+		return nil, err
+	}
+	memSnapshotID = validatedMemSnapshotID
+
+	rootfsActiveRefs, memActiveRefs := s.collectActiveSnapshotParentRefs(namespace, snapshotID, memSnapshotID)
+	rootfsAliases, memAliases := s.collectViewAliasRefs(namespace, snapshotID, memSnapshotID)
+	rootfsViewRef, memViewRef := s.inspectViewMountRefs(namespace, snapshotID, memSnapshotID)
+	if len(rootfsActiveRefs) > 0 || len(memActiveRefs) > 0 || len(rootfsAliases) > 0 || len(memAliases) > 0 {
+		return nil, fmt.Errorf("%w: snapshot %s has active runtime references", ErrSnapshotInUse, snapshotID)
+	}
+	if rootfsViewRef.inUse || memViewRef.inUse {
+		return nil, fmt.Errorf("%w: snapshot %s has active shared view mounts", ErrSnapshotInUse, snapshotID)
+	}
+
+	if rootfsViewRef.zeroRef {
+		if err := s.viewMgr.releaseViewMount(s.snt, namespace, snapshotID); err != nil {
+			return nil, fmt.Errorf("release rootfs shared view for %s: %w", snapshotID, err)
+		}
+	}
+	if memViewRef.zeroRef {
+		if err := s.viewMgr.releaseViewMount(s.snt, namespace, memSnapshotID); err != nil {
+			return nil, fmt.Errorf("release mem shared view for %s: %w", memSnapshotID, err)
+		}
+	}
+
+	children, err := s.collectCommittedSnapshotChildren(ctx, namespace, snapshotID, memSnapshotID)
+	if err != nil {
+		return nil, err
+	}
+	if len(children) > 0 {
+		return nil, fmt.Errorf("%w: snapshot %s has dependent snapshots %v", ErrSnapshotInUse, snapshotID, children)
+	}
+
+	if memSnapshotID != "" {
+		if err := s.snt.Remove(ctx, namespace, memSnapshotID); err != nil {
+			if !errdefs.IsNotFound(err) {
+				if errdefs.IsFailedPrecondition(err) {
+					return nil, fmt.Errorf("%w: committed mem snapshot %s is still referenced", ErrSnapshotInUse, memSnapshotID)
+				}
+				return nil, fmt.Errorf("remove committed mem snapshot %s: %w", memSnapshotID, err)
+			}
+		}
+	}
+
+	if err := s.snt.Remove(ctx, namespace, snapshotID); err != nil {
+		if errdefs.IsFailedPrecondition(err) {
+			return nil, fmt.Errorf("%w: snapshot %s is still referenced", ErrSnapshotInUse, snapshotID)
+		}
+		return nil, fmt.Errorf("remove committed snapshot %s: %w", snapshotID, err)
+	}
+
+	return &DeleteResult{
+		Namespace:     namespace,
+		SnapshotId:    snapshotID,
+		MemSnapshotId: memSnapshotID,
+	}, nil
+}
+
+func (s *server) validateCommittedMemSnapshot(ctx context.Context, namespace, rootfsSnapshotID, memSnapshotID string) (string, error) {
+	if memSnapshotID == "" {
+		return "", nil
+	}
+
+	memInfo, err := s.snt.Stat(ctx, namespace, memSnapshotID)
+	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("stat mem snapshot %s in namespace %s: %w", memSnapshotID, namespace, err)
+	}
+	if memInfo.Kind != snapshots.KindCommitted {
+		return "", fmt.Errorf("%w: mem snapshot %s is not committed", ErrSnapshotNotDeletable, memSnapshotID)
+	}
+	if memInfo.Labels == nil || memInfo.Labels[common.SnapshotLabelRootfsSnapshot] != rootfsSnapshotID {
+		return "", fmt.Errorf("%w: mem snapshot %s is not associated with rootfs snapshot %s", ErrSnapshotNotDeletable, memSnapshotID, rootfsSnapshotID)
+	}
+	return memSnapshotID, nil
+}
+
+func isCommittedUserSnapshot(info *snapshots.Info) bool {
+	if info == nil || info.Kind != snapshots.KindCommitted || info.Labels == nil {
+		return false
+	}
+	if info.Labels[common.SnapshotLabel] != "true" {
+		return false
+	}
+	if info.Labels[common.SnapshotLabelMemSnapshot] == "" {
+		return false
+	}
+	if info.Labels[common.SnapshotLabelVMSnapshot] == "" {
+		return false
+	}
+	return true
+}
+
+type viewMountUsage struct {
+	zeroRef bool
+	inUse   bool
+}
+
+func (s *server) collectActiveSnapshotParentRefs(namespace, rootfsSnapshotID, memSnapshotID string) (rootfsRefs, memRefs []string) {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+
+	for key, info := range s.activeSnapshots[namespace] {
+		if info == nil {
+			continue
+		}
+		switch {
+		case info.Parent == rootfsSnapshotID:
+			rootfsRefs = append(rootfsRefs, key)
+		case memSnapshotID != "" && info.Parent == memSnapshotID:
+			memRefs = append(memRefs, key)
+		}
+	}
+	return rootfsRefs, memRefs
+}
+
+func (s *server) collectViewAliasRefs(namespace, rootfsSnapshotID, memSnapshotID string) (rootfsAliases, memAliases []string) {
+	s.viewMgr.viewLock.Lock()
+	defer s.viewMgr.viewLock.Unlock()
+
+	for aliasKey, parentSnapshotID := range s.viewMgr.viewAliases[namespace] {
+		switch {
+		case parentSnapshotID == rootfsSnapshotID:
+			rootfsAliases = append(rootfsAliases, aliasKey)
+		case memSnapshotID != "" && parentSnapshotID == memSnapshotID:
+			memAliases = append(memAliases, aliasKey)
+		}
+	}
+	return rootfsAliases, memAliases
+}
+
+func (s *server) inspectViewMountRefs(namespace, rootfsSnapshotID, memSnapshotID string) (rootfsRef, memRef viewMountUsage) {
+	s.viewMgr.viewLock.Lock()
+	defer s.viewMgr.viewLock.Unlock()
+
+	if nsMap, ok := s.viewMgr.viewMounts[namespace]; ok {
+		if ref, ok := nsMap[rootfsSnapshotID]; ok {
+			rootfsRef = classifyViewMountUsage(ref)
+		}
+		if memSnapshotID != "" {
+			if ref, ok := nsMap[memSnapshotID]; ok {
+				memRef = classifyViewMountUsage(ref)
+			}
+		}
+	}
+	return rootfsRef, memRef
+}
+
+func classifyViewMountUsage(ref *viewMountRef) viewMountUsage {
+	if ref == nil {
+		return viewMountUsage{}
+	}
+	if ref.ready != nil || ref.refCount > 0 {
+		return viewMountUsage{inUse: true}
+	}
+	if ref.refCount == 0 {
+		return viewMountUsage{zeroRef: true}
+	}
+	return viewMountUsage{}
+}
+
+func (s *server) collectCommittedSnapshotChildren(ctx context.Context, namespace, rootfsSnapshotID, memSnapshotID string) ([]string, error) {
+	result := make(map[string]*snapshots.Info)
+	if err := s.snt.List(ctx, namespace, result); err != nil {
+		return nil, fmt.Errorf("list snapshots in namespace %s: %w", namespace, err)
+	}
+
+	children := make([]string, 0)
+	for key, info := range result {
+		if info == nil {
+			continue
+		}
+		if info.Parent != rootfsSnapshotID && (memSnapshotID == "" || info.Parent != memSnapshotID) {
+			continue
+		}
+		children = append(children, key)
+	}
+	return children, nil
 }
 
 // getActiveSnapshot retrieves runtime active snapshot info from cache.
@@ -435,7 +736,7 @@ func (s *server) Commit(ctx context.Context, namespace, snapshotID, key string, 
 
 	configUpdater := &configUpdater{}
 	configFilePath := filepath.Join(conf.SnapDir(), common.SnapshotConfigFileName)
-	if err := configUpdater.updateSnapshotConfig(configFilePath, viewConf.KernelFile(), viewConf.InitrdFile(), viewConf.SnapshotMemFile(), viewConf.PmemFiles(),0,""); err != nil {
+	if err := configUpdater.updateSnapshotConfig(configFilePath, viewConf.KernelFile(), viewConf.InitrdFile(), viewConf.SnapshotMemFile(), viewConf.PmemFiles(), 0, ""); err != nil {
 		return fmt.Errorf("update snapshot config failed: %v", err)
 	}
 

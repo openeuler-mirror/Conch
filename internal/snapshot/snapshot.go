@@ -2,8 +2,10 @@ package snapshot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 
 	"github.com/containerd/containerd/snapshots"
 
@@ -89,6 +91,35 @@ type ParentSnapshotIDs struct {
 	VM     string
 }
 
+type ListRequest struct {
+	Namespace string `json:"namespace"`
+}
+
+type GetRequest struct {
+	Namespace  string `json:"namespace"`
+	SnapshotId string `json:"snapshot_id"`
+}
+
+type DeleteRequest struct {
+	Namespace  string `json:"namespace"`
+	SnapshotId string `json:"snapshot_id"`
+}
+
+type SnapshotInfo struct {
+	Namespace  string `json:"namespace"`
+	SnapshotId string `json:"snapshot_id"`
+}
+
+type DeleteResult struct {
+	Namespace     string `json:"namespace"`
+	SnapshotId    string `json:"snapshot_id"`
+	MemSnapshotId string `json:"mem_snapshot_id,omitempty"`
+}
+
+var ErrSnapshotNotFound = errors.New("snapshot not found")
+var ErrSnapshotInUse = errors.New("snapshot in use")
+var ErrSnapshotNotDeletable = errors.New("snapshot not deletable")
+
 // Prepare creates 3 new active snapshots for image-based startup.
 func Prepare(ctx context.Context, namespace, key string, parents ParentSnapshotIDs, opts ...Opt) (*SnapshotConfig, error) {
 	if gServer.snt == nil {
@@ -115,7 +146,6 @@ func AcquireResumeWorkspace(ctx context.Context, namespace, key string, parents 
 	}
 	return gServer.AcquireResumeWorkspace(ctx, namespace, key, parents, cid, socketPath, opts...)
 }
-
 
 // ResolveParentSnapshotIDs resolves parent mem/vm snapshots from rootfs snapshot.
 func ResolveParentSnapshotIDs(namespace, rootfs string) (ParentSnapshotIDs, error) {
@@ -146,6 +176,36 @@ func Remove(ctx context.Context, namespace, key string) error {
 		return fmt.Errorf("server not init")
 	}
 	return gServer.Remove(ctx, namespace, key)
+}
+
+func List(req ListRequest) ([]SnapshotInfo, error) {
+	if gServer.snt == nil {
+		return nil, fmt.Errorf("server not init")
+	}
+	return gServer.List(req)
+}
+
+func Get(req GetRequest) (*SnapshotInfo, error) {
+	if gServer.snt == nil {
+		return nil, fmt.Errorf("server not init")
+	}
+	return gServer.Get(req)
+}
+
+func DeleteCommitted(req DeleteRequest) (*DeleteResult, error) {
+	if gServer.snt == nil {
+		return nil, fmt.Errorf("server not init")
+	}
+	return gServer.DeleteCommitted(req)
+}
+
+func sortSnapshotInfos(items []SnapshotInfo) {
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Namespace == items[j].Namespace {
+			return items[i].SnapshotId < items[j].SnapshotId
+		}
+		return items[i].Namespace < items[j].Namespace
+	})
 }
 
 // CleanupAllViews unmounts and removes all view snapshots.
