@@ -23,6 +23,7 @@ const (
 	parentLabel        = "io.conch.template.parent"
 	sourceSandboxLabel = "io.conch.template.source-sandbox"
 	sourceRefLabel     = "io.conch.template.source-ref"
+	lazyLabel          = "io.conch.template.lazy"
 	userLabelPrefix    = "io.conch.template.user."
 	schemaVersion      = "1"
 )
@@ -39,7 +40,7 @@ func NewStore(client *containerdclient.Client) *Store {
 	return &Store{images: client.ImageService(), content: client.ContentStore()}
 }
 
-func (s *Store) Create(ctx context.Context, entry conchtemplate.Entry, target ocispec.Descriptor) (conchtemplate.Entry, error) {
+func (s *Store) Create(ctx context.Context, entry conchtemplate.Entry, target ocispec.Descriptor, options ...conchtemplate.CreateOptions) (conchtemplate.Entry, error) {
 	if err := s.configured(); err != nil {
 		return conchtemplate.Entry{}, err
 	}
@@ -53,7 +54,15 @@ func (s *Store) Create(ctx context.Context, entry conchtemplate.Entry, target oc
 		))
 	}
 	nsctx := containerdclient.NewNamespaceContext(ctx)
-	info, err := conchimage.InspectBootIndexContent(nsctx, s.content, target)
+	var opts conchtemplate.CreateOptions
+	if len(options) > 0 {
+		opts = options[0]
+	}
+	inspect := conchimage.InspectBootIndexContent
+	if opts.AllowMissingMemory {
+		inspect = conchimage.InspectLazyBootIndexContent
+	}
+	info, err := inspect(nsctx, s.content, target)
 	if err != nil {
 		return conchtemplate.Entry{}, conchtemplate.ErrInvalidArtifact.Wrap(err)
 	}
@@ -74,9 +83,16 @@ func (s *Store) Create(ctx context.Context, entry conchtemplate.Entry, target oc
 	if err != nil {
 		return conchtemplate.Entry{}, err
 	}
-	labelChildren := images.SetChildrenLabels(s.content, images.ChildrenHandler(s.content))
-	if err := images.WalkNotEmpty(nsctx, labelChildren, target); err != nil {
-		return conchtemplate.Entry{}, fmt.Errorf("label Template content: %w", err)
+	if opts.AllowMissingMemory {
+		recordLabels[lazyLabel] = "true"
+		if err := labelLazyContent(nsctx, s.content, target); err != nil {
+			return conchtemplate.Entry{}, fmt.Errorf("label lazy Template content: %w", err)
+		}
+	} else {
+		labelChildren := images.SetChildrenLabels(s.content, images.ChildrenHandler(s.content))
+		if err := images.WalkNotEmpty(nsctx, labelChildren, target); err != nil {
+			return conchtemplate.Entry{}, fmt.Errorf("label Template content: %w", err)
+		}
 	}
 	record, err := s.images.Create(nsctx, images.Image{
 		Name: name, Target: target, Labels: recordLabels,
@@ -178,7 +194,11 @@ func (s *Store) entryFromRecord(ctx context.Context, record images.Image) (conch
 	if err != nil || record.Name != wantName {
 		return conchtemplate.Entry{}, conchtemplate.ErrInvalidArtifact.Wrap(fmt.Errorf("invalid canonical Template record %s", record.Name))
 	}
-	info, err := conchimage.InspectBootIndexContent(ctx, s.content, record.Target)
+	inspect := conchimage.InspectBootIndexContent
+	if record.Labels[lazyLabel] == "true" {
+		inspect = conchimage.InspectLazyBootIndexContent
+	}
+	info, err := inspect(ctx, s.content, record.Target)
 	if err != nil {
 		return conchtemplate.Entry{}, conchtemplate.ErrInvalidArtifact.Wrap(err)
 	}
@@ -212,6 +232,20 @@ func (s *Store) entryFromRecord(ctx context.Context, record images.Image) (conch
 func (s *Store) configured() error {
 	if s == nil || s.images == nil || s.content == nil {
 		return fmt.Errorf("template store is not configured")
+	}
+	return nil
+}
+
+func labelLazyContent(ctx context.Context, store content.Store, target ocispec.Descriptor) error {
+	labeler := images.SetChildrenLabels(store, images.ChildrenHandler(store))
+	components, err := labeler.Handle(ctx, target)
+	if err != nil {
+		return err
+	}
+	for _, component := range components {
+		if _, err := labeler.Handle(ctx, component); err != nil {
+			return err
+		}
 	}
 	return nil
 }

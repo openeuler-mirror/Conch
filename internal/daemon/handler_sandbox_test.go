@@ -230,7 +230,7 @@ func TestHandleInspectMissingTemplateReturnsDomainError(t *testing.T) {
 
 type missingTemplateStore struct{}
 
-func (missingTemplateStore) Create(context.Context, conchtemplate.Entry, ocispec.Descriptor) (conchtemplate.Entry, error) {
+func (missingTemplateStore) Create(context.Context, conchtemplate.Entry, ocispec.Descriptor, ...conchtemplate.CreateOptions) (conchtemplate.Entry, error) {
 	return conchtemplate.Entry{}, conchtemplate.ErrNotFound.New()
 }
 

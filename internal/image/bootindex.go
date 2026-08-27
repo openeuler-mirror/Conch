@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -27,8 +28,11 @@ import (
 )
 
 const (
-	AnnotationVMM          = "io.conch.vmm"
-	AnnotationMemorySizeMB = "io.conch.memory-size-mb"
+	AnnotationVMM              = "io.conch.vmm"
+	AnnotationMemorySizeMB     = "io.conch.memory-size-mb"
+	AnnotationPreGateProfile   = "io.conch.pre-gate.profile.v1"
+	AnnotationMemoryFileOffset = "io.conch.memory-file-offset"
+	AnnotationMemoryFileSize   = "io.conch.memory-file-size"
 )
 
 type BootIndexContentOptions struct {
@@ -131,14 +135,20 @@ func buildKernelComponentInContent(ctx context.Context, store content.Store, ker
 	if err := continuityfs.CopyFile(filepath.Join(root, "data", "conch.initrd"), initrdPath); err != nil {
 		return ocispec.Descriptor{}, err
 	}
-	return BuildNativeComponentInContent(ctx, store, []string{root}, KindSandbox)
+	return BuildNativeComponentInContent(ctx, store, []string{root}, KindSandbox, false)
 }
 
 // BuildNativeComponentInContent writes regular native EROFS files and/or
 // directories converted to native EROFS layers into store, then publishes the
 // component manifest and config. It accepts only the three supported Conch
 // component kinds and rejects symlink/special-file inputs.
-func BuildNativeComponentInContent(ctx context.Context, store content.Store, paths []string, kind string) (ocispec.Descriptor, error) {
+//
+// annotateMemExtent is honored only for KindMemSnapshot directory components:
+// when set, the checkpoint memory file's EROFS extent is inspected (via
+// dump.erofs) and recorded on the layer descriptor. Pre-gate lazy pull consumes
+// these annotations to fetch exactly the mapped pages, so the regular
+// capture/publish path keeps it false and never depends on dump.erofs.
+func BuildNativeComponentInContent(ctx context.Context, store content.Store, paths []string, kind string, annotateMemExtent bool) (ocispec.Descriptor, error) {
 	if store == nil {
 		return ocispec.Descriptor{}, fmt.Errorf("content store is required")
 	}
@@ -186,6 +196,26 @@ func BuildNativeComponentInContent(ctx context.Context, store content.Store, pat
 		desc, err := writeFileBlobToContent(ctx, store, layerPath, erofsconvert.NativeLayerMediaType)
 		if err != nil {
 			return ocispec.Descriptor{}, err
+		}
+		if kind == KindMemSnapshot && info.IsDir() && annotateMemExtent {
+			memoryPath := filepath.Join(path, "conch", "snapshot", "memory")
+			memoryInfo, statErr := os.Stat(memoryPath)
+			if statErr != nil && !os.IsNotExist(statErr) {
+				return ocispec.Descriptor{}, fmt.Errorf("stat checkpoint memory: %w", statErr)
+			}
+			if statErr == nil {
+				offset, extentSize, extentErr := inspectErofsMemoryExtent(ctx, layerPath)
+				if extentErr != nil {
+					return ocispec.Descriptor{}, extentErr
+				}
+				if extentSize < memoryInfo.Size() {
+					return ocispec.Descriptor{}, fmt.Errorf("checkpoint memory extent size %d is smaller than file size %d", extentSize, memoryInfo.Size())
+				}
+				desc.Annotations = mergeAnnotations(desc.Annotations, map[string]string{
+					AnnotationMemoryFileOffset: strconv.FormatInt(offset, 10),
+					AnnotationMemoryFileSize:   strconv.FormatInt(memoryInfo.Size(), 10),
+				})
+			}
 		}
 		layerDescs = append(layerDescs, desc)
 		diffIDs = append(diffIDs, desc.Digest)
@@ -455,6 +485,28 @@ func inspectBootIndexByDigest(ctx context.Context, store content.Store, rawDiges
 	return desc, info, nil
 }
 
+func inspectBootIndexMetadataByDigest(ctx context.Context, store content.Store, rawDigest string) (ocispec.Descriptor, BootIndexInfo, error) {
+	dgst, err := digest.Parse(strings.TrimSpace(rawDigest))
+	if err != nil {
+		return ocispec.Descriptor{}, BootIndexInfo{}, err
+	}
+	info, err := store.Info(ctx, dgst)
+	if err != nil {
+		return ocispec.Descriptor{}, BootIndexInfo{}, err
+	}
+	desc := ocispec.Descriptor{MediaType: ocispec.MediaTypeImageIndex, Digest: dgst, Size: info.Size}
+	raw, err := content.ReadBlob(ctx, store, desc)
+	if err != nil {
+		return ocispec.Descriptor{}, BootIndexInfo{}, err
+	}
+	var index ocispec.Index
+	if err := json.Unmarshal(raw, &index); err != nil {
+		return ocispec.Descriptor{}, BootIndexInfo{}, err
+	}
+	metadata, err := inspectBootIndexMetadata(desc, index)
+	return desc, metadata, err
+}
+
 // InspectBootIndexContent validates the complete descriptor closure rooted at
 // desc and returns the typed Conch components. It rejects unknown and duplicate
 // component kinds before the index can be used for startup.
@@ -491,6 +543,84 @@ func InspectBootIndexContent(ctx context.Context, store content.Store, desc ocis
 	return info, nil
 }
 
+// InspectLazyBootIndexContent validates the closure fetched for a lazy resume
+// Template. Only the memory layer blob may be absent; its manifest, config,
+// descriptor metadata, and every other component must already be present.
+func InspectLazyBootIndexContent(ctx context.Context, store content.Store, desc ocispec.Descriptor) (BootIndexInfo, error) {
+	if store == nil {
+		return BootIndexInfo{}, fmt.Errorf("content store is required")
+	}
+	if desc.MediaType != ocispec.MediaTypeImageIndex {
+		return BootIndexInfo{}, ErrInvalidContent.Wrap(fmt.Errorf("boot index %s has media type %q, want %q", desc.Digest, desc.MediaType, ocispec.MediaTypeImageIndex))
+	}
+	if err := validateStoredDescriptor(ctx, store, desc); err != nil {
+		return BootIndexInfo{}, err
+	}
+	raw, err := content.ReadBlob(ctx, store, desc)
+	if err != nil {
+		return BootIndexInfo{}, fmt.Errorf("read boot index %s: %w", desc.Digest, err)
+	}
+	var index ocispec.Index
+	if err := json.Unmarshal(raw, &index); err != nil {
+		return BootIndexInfo{}, ErrInvalidContent.Wrap(fmt.Errorf("unmarshal boot index %s: %w", desc.Digest, err))
+	}
+	if index.MediaType != "" && index.MediaType != ocispec.MediaTypeImageIndex {
+		return BootIndexInfo{}, ErrInvalidContent.Wrap(fmt.Errorf("boot index %s declares media type %q", desc.Digest, index.MediaType))
+	}
+	info, err := inspectBootIndexMetadata(desc, index)
+	if err != nil {
+		return BootIndexInfo{}, ErrInvalidContent.Wrap(err)
+	}
+	if !info.Resume {
+		return BootIndexInfo{}, ErrInvalidContent.Wrap(fmt.Errorf("lazy boot index %s is not a resume Template", desc.Digest))
+	}
+	for _, component := range index.Manifests {
+		if err := validateStoredDescriptor(ctx, store, component); err != nil {
+			return BootIndexInfo{}, err
+		}
+		manifest, err := readManifest(ctx, store, component)
+		if err != nil {
+			return BootIndexInfo{}, fmt.Errorf("read component manifest %s: %w", component.Digest, err)
+		}
+		if manifest.MediaType != "" && manifest.MediaType != ocispec.MediaTypeImageManifest {
+			return BootIndexInfo{}, ErrInvalidContent.Wrap(fmt.Errorf("component %s declares media type %q", component.Digest, manifest.MediaType))
+		}
+		if err := validateStoredDescriptor(ctx, store, manifest.Config); err != nil {
+			return BootIndexInfo{}, err
+		}
+		if getKind(component) == KindMemSnapshot {
+			metadata, err := parseLazyMemoryMetadata(info.PreGateProfile, manifest)
+			if err != nil {
+				return BootIndexInfo{}, ErrInvalidContent.Wrap(err)
+			}
+			if err := validateStoredDescriptor(ctx, store, metadata.Layer); err != nil && !errdefs.IsNotFound(err) {
+				return BootIndexInfo{}, err
+			}
+			continue
+		}
+		for _, layer := range manifest.Layers {
+			if err := validateStoredDescriptor(ctx, store, layer); err != nil {
+				return BootIndexInfo{}, err
+			}
+		}
+	}
+	return info, nil
+}
+
+func validateStoredDescriptor(ctx context.Context, store content.Store, desc ocispec.Descriptor) error {
+	if err := validateDescriptor(desc, "content"); err != nil {
+		return ErrInvalidContent.Wrap(err)
+	}
+	info, err := store.Info(ctx, desc.Digest)
+	if err != nil {
+		return fmt.Errorf("content %s is unavailable: %w", desc.Digest, err)
+	}
+	if desc.Size > 0 && info.Size != desc.Size {
+		return ErrInvalidContent.Wrap(fmt.Errorf("content %s size %d does not match descriptor size %d", desc.Digest, info.Size, desc.Size))
+	}
+	return nil
+}
+
 // inspectBootIndexMetadata validates the metadata carried by the top-level
 // index and its component descriptors without reading referenced content.
 func inspectBootIndexMetadata(desc ocispec.Descriptor, index ocispec.Index) (BootIndexInfo, error) {
@@ -503,6 +633,7 @@ func inspectBootIndexMetadata(desc ocispec.Descriptor, index ocispec.Index) (Boo
 		RootfsDescriptor:  components[KindRootfs],
 		MemDescriptor:     components[KindMemSnapshot],
 		SandboxDescriptor: components[KindSandbox],
+		PreGateProfile:    strings.TrimSpace(index.Annotations[AnnotationPreGateProfile]),
 	}
 	info.Resume = info.MemDescriptor.Digest != ""
 	indexVMM := strings.TrimSpace(index.Annotations[AnnotationVMM])
@@ -617,6 +748,53 @@ func buildErofsLayer(ctx context.Context, srcDir, outPath string) error {
 		return fmt.Errorf("mkfs.erofs %s: %s: %w", srcDir, strings.TrimSpace(string(out)), err)
 	}
 	return nil
+}
+
+func inspectErofsMemoryExtent(ctx context.Context, imagePath string) (int64, int64, error) {
+	cmd := exec.CommandContext(ctx, "dump.erofs", "-e", "--path=/conch/snapshot/memory", imagePath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return 0, 0, fmt.Errorf("inspect checkpoint memory extent: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	offset, extentSize, err := parseErofsMemoryExtentOutput(string(out))
+	if err != nil {
+		return 0, 0, err
+	}
+	return offset, extentSize, nil
+}
+
+// erofsExtentLine matches a dump.erofs -e extent row:
+//
+//	0:        0..    4096 |    4096 :       4096..      8192 |    4096
+//
+// dump.erofs pads numbers with spaces to align columns, so the row is parsed
+// by structure instead of column positions.
+var erofsExtentLine = regexp.MustCompile(`^\s*(\d+):\s+(\d+)\.\.\s*\d+\s*\|\s*\d+\s*:\s+(\d+)\.\.\s*\d+\s*\|\s*(\d+)\s*$`)
+
+func parseErofsMemoryExtentOutput(output string) (int64, int64, error) {
+	var extentOffset, extentSize int64
+	extentCount := 0
+	for _, line := range strings.Split(output, "\n") {
+		match := erofsExtentLine.FindStringSubmatch(line)
+		if match == nil {
+			continue
+		}
+		offset, offsetErr := strconv.ParseInt(match[3], 10, 64)
+		size, sizeErr := strconv.ParseInt(match[4], 10, 64)
+		if offsetErr != nil || sizeErr != nil || offset < 0 || size <= 0 {
+			break
+		}
+		extentCount++
+		extentOffset = offset
+		extentSize = size
+		if extentCount > 1 || match[1] != "0" || match[2] != "0" {
+			break
+		}
+	}
+	if extentCount != 1 {
+		return 0, 0, fmt.Errorf("checkpoint memory is not a single contiguous EROFS extent (found %d)", extentCount)
+	}
+	return extentOffset, extentSize, nil
 }
 
 func mergeAnnotations(base, extra map[string]string) map[string]string {

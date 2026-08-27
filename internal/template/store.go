@@ -11,8 +11,12 @@ type Filter struct {
 	BootMode BootMode
 }
 
+type CreateOptions struct {
+	AllowMissingMemory bool
+}
+
 type Store interface {
-	Create(context.Context, Entry, ocispec.Descriptor) (Entry, error)
+	Create(context.Context, Entry, ocispec.Descriptor, ...CreateOptions) (Entry, error)
 	Get(context.Context, string) (Entry, error)
 	List(context.Context, Filter) ([]Entry, error)
 	Delete(context.Context, string) error

@@ -29,7 +29,9 @@ type ResourceArgs struct {
 	VirtioFS   []VirtioFSDevice
 
 	// Snapshot
-	SnapfilePath string
+	SnapfilePath      string
+	ResumeGatePath    string
+	RecordPreGatePath string
 
 	// Vsock
 	VsockCID        uint32

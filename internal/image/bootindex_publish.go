@@ -2,12 +2,16 @@ package image
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"strings"
 
 	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/remotes/docker"
 	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	containerdclient "github.com/openeuler/Conch/internal/adapters/containerd/client"
 )
@@ -99,6 +103,12 @@ func PushBootIndex(ctx context.Context, client *containerdclient.Client, req Pus
 	if err != nil {
 		return fmt.Errorf("validate boot index %s before push: %w", req.BootIndexDigest, err)
 	}
+	if len(req.PreGateProfile) != 0 {
+		desc, err = bootIndexWithPreGateProfile(pushCtx, client.ContentStore(), desc, req.PreGateProfile)
+		if err != nil {
+			return fmt.Errorf("attach pre-gate profile to boot index: %w", err)
+		}
+	}
 	resolver := docker.NewResolver(docker.ResolverOptions{
 		PlainHTTP: req.PlainHTTP,
 		Credentials: func(string) (string, string, error) {
@@ -109,6 +119,33 @@ func PushBootIndex(ctx context.Context, client *containerdclient.Client, req Pus
 		return translateRegistryError(fmt.Errorf("push boot index %s -> %s: %w", desc.Digest, req.RemoteReference, err))
 	}
 	return nil
+}
+
+func bootIndexWithPreGateProfile(ctx context.Context, store content.Store, desc ocispec.Descriptor, profile []byte) (ocispec.Descriptor, error) {
+	var identity struct {
+		Version  int      `json:"version"`
+		PageSize int64    `json:"page_size"`
+		FileSize int64    `json:"file_size"`
+		Offsets  []uint64 `json:"offsets"`
+	}
+	if err := json.Unmarshal(profile, &identity); err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("decode pre-gate profile: %w", err)
+	}
+	if identity.Version != 1 || identity.PageSize <= 0 || identity.FileSize <= 0 || len(identity.Offsets) == 0 {
+		return ocispec.Descriptor{}, fmt.Errorf("pre-gate profile is incomplete")
+	}
+	raw, err := content.ReadBlob(ctx, store, desc)
+	if err != nil {
+		return ocispec.Descriptor{}, err
+	}
+	var index ocispec.Index
+	if err := json.Unmarshal(raw, &index); err != nil {
+		return ocispec.Descriptor{}, err
+	}
+	index.Annotations = mergeAnnotations(index.Annotations, map[string]string{
+		AnnotationPreGateProfile: base64.RawStdEncoding.EncodeToString(profile),
+	})
+	return writeBlobJSONToContent(ctx, store, index, ocispec.MediaTypeImageIndex)
 }
 
 // PublishCheckpointBootIndex packages captured memory and VMM state into OCI
@@ -152,11 +189,21 @@ func PublishCheckpointBootIndex(
 		return PublishCheckpointBootIndexResult{}, fmt.Errorf("source boot index VMM %q does not match capture VMM %q", sourceInfo.VMMName, req.VMMName)
 	}
 
-	memDesc, err := BuildNativeComponentInContent(ctx, client.ContentStore(), []string{req.MemRoot}, KindMemSnapshot)
+	namespaceCtx := containerdclient.NewNamespaceContext(ctx)
+	publishCtx, done, err := client.WithLease(namespaceCtx)
+	if err != nil {
+		return PublishCheckpointBootIndexResult{}, fmt.Errorf("create content lease: %w", err)
+	}
+	defer done(publishCtx)
+	_, sourceInfo, err = inspectBootIndexByDigest(publishCtx, client.ContentStore(), req.SourceBootIndexDigest)
+	if err != nil {
+		return PublishCheckpointBootIndexResult{}, fmt.Errorf("inspect source boot index: %w", err)
+	}
+	memDesc, err := BuildNativeComponentInContent(publishCtx, client.ContentStore(), []string{req.MemRoot}, KindMemSnapshot, req.AnnotateMemExtent)
 	if err != nil {
 		return PublishCheckpointBootIndexResult{}, fmt.Errorf("publish captured mem component: %w", err)
 	}
-	indexDesc, err := BuildBootIndexInContent(ctx, client.ContentStore(), BootIndexContentOptions{
+	indexDesc, err := BuildBootIndexInContent(publishCtx, client.ContentStore(), BootIndexContentOptions{
 		RootfsDescriptor:  sourceInfo.RootfsDescriptor,
 		MemDescriptor:     memDesc,
 		SandboxDescriptor: sourceInfo.SandboxDescriptor,

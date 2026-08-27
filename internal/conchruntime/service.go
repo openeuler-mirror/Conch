@@ -51,6 +51,16 @@ type Service struct {
 	SandboxDefaults   SandboxDefaults
 	WebhookDispatcher *webhook.Dispatcher
 	lifecycleLocks    sandboxLifecycleLocks
+	PreGateEnabled    bool
+	PreGateStateDir   string
+}
+
+func (s *Service) SetPreGate(enabled bool, stateDir string) {
+	if s == nil {
+		return
+	}
+	s.PreGateEnabled = enabled
+	s.PreGateStateDir = strings.TrimSpace(stateDir)
 }
 
 type sandboxLifecycleLock struct {
@@ -470,6 +480,11 @@ func (s *Service) CheckpointSandbox(ctx context.Context, opts SandboxCheckpointO
 	if parentID == "" {
 		return SandboxCheckpointResult{}, sandbox.ErrFailedPrecondition.Wrap(fmt.Errorf("sandbox %s has no checkpoint head Template ID", sandboxID))
 	}
+	if s.PreGateEnabled {
+		if err := conchimage.EnsureLazyMemoryContent(ctx, s.Containerd, parentID, s.PreGateStateDir); err != nil {
+			return SandboxCheckpointResult{}, fmt.Errorf("prepare parent template for checkpoint: %w", err)
+		}
+	}
 
 	captured, err := s.Sandbox.Checkpoint(sandbox.CheckpointRequest{
 		SandboxID: sandboxID,
@@ -489,6 +504,7 @@ func (s *Service) CheckpointSandbox(ctx context.Context, opts SandboxCheckpointO
 		MemRoot:               captured.MemRootPath,
 		VMMName:               captured.VMMName,
 		MemorySizeMB:          captured.MemorySizeMB,
+		AnnotateMemExtent:     s.PreGateEnabled,
 	})
 	if err != nil {
 		return SandboxCheckpointResult{}, err
@@ -561,10 +577,11 @@ func (s *Service) PullTemplate(ctx context.Context, opts TemplatePullOptions) (T
 	}
 	defer done(pullCtx)
 	pulled, err := conchimage.PullBootIndex(pullCtx, s.Containerd, conchimage.RegistryPullOptions{
-		Reference: reference,
-		PlainHTTP: opts.PlainHTTP,
-		Username:  opts.Username,
-		Password:  opts.Password,
+		Reference:  reference,
+		PlainHTTP:  opts.PlainHTTP,
+		Username:   opts.Username,
+		Password:   opts.Password,
+		PreferLazy: s.PreGateEnabled,
 	})
 	if err != nil {
 		return TemplatePullResult{}, fmt.Errorf("pull template boot index %s: %w", reference, translateTemplateArtifactError(err))
@@ -576,17 +593,30 @@ func (s *Service) PullTemplate(ctx context.Context, opts TemplatePullOptions) (T
 		origin = conchtemplate.OriginCheckpoint
 		bootMode = conchtemplate.BootModeResume
 	}
+	labels := copyMap(opts.Labels)
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+	if opts.PlainHTTP {
+		labels[conchimage.TemplateLabelRegistryPlainHTTP] = "true"
+	}
 	entry, createErr := s.Templates.Create(pullCtx, conchtemplate.Entry{
 		Origin:          origin,
 		BootMode:        bootMode,
 		BootIndexDigest: info.BootIndexDigest,
 		SourceRef:       reference,
-		Labels:          opts.Labels,
-	}, pulled.Target)
-	cleanupErr := conchimage.RemoveFetchedImageRecord(
-		ctx, s.Containerd.ImageService(), pulled.SourceImageName, pulled.Target,
-	)
+		Labels:          labels,
+	}, pulled.Target, conchtemplate.CreateOptions{AllowMissingMemory: pulled.Lazy})
+	var cleanupErr error
+	if pulled.SourceImageName != "" {
+		cleanupErr = conchimage.RemoveFetchedImageRecord(
+			ctx, s.Containerd.ImageService(), pulled.SourceImageName, pulled.Target,
+		)
+	}
 	if createErr != nil {
+		if !errors.Is(createErr, conchtemplate.ErrAlreadyExists) {
+			s.cleanupTemplateRecord(ctx, info.BootIndexDigest)
+		}
 		return TemplatePullResult{}, errors.Join(createErr, cleanupErr)
 	}
 	if cleanupErr != nil {
@@ -624,12 +654,26 @@ func (s *Service) PushTemplate(ctx context.Context, opts TemplatePushOptions) er
 	if bootIndexDigest == "" {
 		return conchtemplate.ErrFailedPrecondition.Wrap(fmt.Errorf("template has no boot index digest"))
 	}
+	if s.PreGateEnabled {
+		if err := conchimage.EnsureLazyMemoryContent(ctx, s.Containerd, bootIndexDigest, s.PreGateStateDir); err != nil {
+			return fmt.Errorf("prepare template for push: %w", err)
+		}
+	}
+	var profile []byte
+	if s.PreGateEnabled && s.PreGateStateDir != "" {
+		profilePath := sandbox.PreGateProfilePath(s.PreGateStateDir, bootIndexDigest)
+		profile, err = os.ReadFile(profilePath)
+		if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("read pre-gate profile: %w", err)
+		}
+	}
 	return conchimage.PushBootIndex(ctx, s.Containerd, conchimage.PushBootIndexOptions{
 		BootIndexDigest: bootIndexDigest,
 		RemoteReference: remoteReference,
 		PlainHTTP:       opts.PlainHTTP,
 		Username:        opts.Username,
 		Password:        opts.Password,
+		PreGateProfile:  profile,
 	})
 }
 
@@ -647,6 +691,11 @@ func (s *Service) UnpackTemplate(ctx context.Context, opts TemplateUnpackOptions
 	rec, err := s.Templates.Get(ctx, id)
 	if err != nil {
 		return fmt.Errorf("get template %s: %w", id, err)
+	}
+	if s.PreGateEnabled {
+		if err := conchimage.EnsureLazyMemoryContent(ctx, s.Containerd, rec.BootIndexDigest, s.PreGateStateDir); err != nil {
+			return fmt.Errorf("prepare template %s for unpack: %w", id, err)
+		}
 	}
 	if err := conchimage.UnpackBootIndex(ctx, s.Containerd, rec.BootIndexDigest); err != nil {
 		return fmt.Errorf("unpack template %s: %w", id, translateTemplateArtifactError(err))

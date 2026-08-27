@@ -5,6 +5,10 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/sync/singleflight"
 
 	containerdclient "github.com/openeuler/Conch/internal/adapters/containerd/client"
 	conchimage "github.com/openeuler/Conch/internal/image"
@@ -12,6 +16,7 @@ import (
 	"github.com/openeuler/Conch/internal/snapshot/common"
 	"github.com/openeuler/Conch/internal/template"
 	"github.com/openeuler/Conch/internal/vmm"
+	"github.com/openeuler/Conch/pkg/ulog"
 )
 
 type TemplateReader interface {
@@ -32,6 +37,14 @@ type BootSpec struct {
 	InitrdPath   string
 	SnapfilePath string
 	PmemPaths    []string
+	PreGateKey   string
+	// PreGateRequired is set only when snapshot memory is still being
+	// materialized. Fully local Boot Index components leave it false.
+	PreGateRequired     bool
+	PreGateProfile      []byte
+	MaterializeCritical func(context.Context, int64, []uint64) error
+	MaterializeAll      func(context.Context) error
+	MaterializeCommit   func() error
 }
 
 type BootRuntime struct {
@@ -69,18 +82,42 @@ type BootPreparer interface {
 }
 
 type bootPreparer struct {
-	templates   TemplateReader
-	snapshots   SnapshotBackend
-	resolveBoot func(context.Context, string) (conchimage.ResolvedBoot, error)
+	templates    TemplateReader
+	snapshots    SnapshotBackend
+	resolveBoot  func(context.Context, string) (conchimage.ResolvedBoot, error)
+	resolveLazy  func(context.Context, template.Entry) (conchimage.ResolvedBoot, error)
+	preGate      bool
+	resolveCache sync.Map // boot index digest -> resolvedTemplateCache
+	resolveGroup singleflight.Group
 }
 
-func NewBootPreparer(templates TemplateReader, snapshots SnapshotBackend, client *containerdclient.Client) (BootPreparer, error) {
+type resolvedTemplateCache struct {
+	resolved conchimage.ResolvedBoot
+	entry    template.Entry
+}
+
+func NewBootPreparer(templates TemplateReader, snapshots SnapshotBackend, client *containerdclient.Client, preGateEnabled bool, preGateStateDir string) (BootPreparer, error) {
 	if client == nil || client.Client == nil {
 		return nil, fmt.Errorf("containerd client is required")
 	}
-	return newBootPreparer(templates, snapshots, func(ctx context.Context, bootIndexDigest string) (conchimage.ResolvedBoot, error) {
+	preparer, err := newBootPreparer(templates, snapshots, func(ctx context.Context, bootIndexDigest string) (conchimage.ResolvedBoot, error) {
 		return conchimage.ResolveBoot(ctx, client, bootIndexDigest)
 	})
+	if err != nil {
+		return nil, err
+	}
+	preparer.(*bootPreparer).preGate = preGateEnabled
+	if preGateEnabled {
+		preparer.(*bootPreparer).resolveLazy = func(ctx context.Context, entry template.Entry) (conchimage.ResolvedBoot, error) {
+			plainHTTP := strings.EqualFold(entry.Labels[conchimage.TemplateLabelRegistryPlainHTTP], "true")
+			return conchimage.ResolveBootLazy(ctx, client, entry.BootIndexDigest, conchimage.LazyResolveOptions{
+				Reference: entry.SourceRef,
+				PlainHTTP: plainHTTP,
+				StateDir:  preGateStateDir,
+			})
+		}
+	}
+	return preparer, nil
 }
 
 func newBootPreparer(
@@ -112,14 +149,19 @@ func (p *bootPreparer) Prepare(ctx context.Context, req PrepareBootRequest) (Pre
 	if key == "" {
 		return PreparedBoot{}, fmt.Errorf("sandbox_id is required")
 	}
+	tResolve := time.Now()
 	resolved, entry, err := p.resolveTemplate(ctx, req.TemplateID)
 	if err != nil {
 		return PreparedBoot{}, err
 	}
+	ulog.GetLogger().Debug("boot prep phase resolveTemplate", ulog.F("sandbox", key), ulog.F("elapsed", time.Since(tResolve)))
 	if err := validateResolvedBoot(resolved, entry.BootMode, strings.TrimSpace(req.VMMName)); err != nil {
 		return PreparedBoot{}, fmt.Errorf("template %s: %w", entry.BootIndexDigest, err)
 	}
-	return p.prepareResolvedBoot(ctx, key, req.VMMName, req.RAMMB, resolved)
+	tLayout := time.Now()
+	prepared, err := p.prepareResolvedBoot(ctx, key, req.VMMName, req.RAMMB, resolved)
+	ulog.GetLogger().Debug("boot prep phase prepareResolvedBoot", ulog.F("sandbox", key), ulog.F("elapsed", time.Since(tLayout)))
+	return prepared, err
 }
 
 func (p *bootPreparer) resolveTemplate(
@@ -138,23 +180,74 @@ func (p *bootPreparer) resolveTemplate(
 	if bootIndexDigest == "" {
 		return conchimage.ResolvedBoot{}, template.Entry{}, fmt.Errorf("template has no boot index digest")
 	}
-	resolved, err := p.resolveBoot(ctx, bootIndexDigest)
+	if !p.preGate {
+		resolved, resolveErr := p.resolveBoot(ctx, bootIndexDigest)
+		if resolveErr != nil {
+			return conchimage.ResolvedBoot{}, template.Entry{}, fmt.Errorf(
+				"resolve template %s boot index %s: %w",
+				entry.BootIndexDigest,
+				bootIndexDigest,
+				resolveErr,
+			)
+		}
+		if resolved.BootIndexDigest != bootIndexDigest {
+			return conchimage.ResolvedBoot{}, template.Entry{}, fmt.Errorf(
+				"resolved boot index digest %s does not match template digest %s",
+				resolved.BootIndexDigest,
+				bootIndexDigest,
+			)
+		}
+		return resolved, entry, nil
+	}
+	if cached, ok := p.loadResolvedTemplate(bootIndexDigest); ok {
+		return cached.resolved, cached.entry, nil
+	}
+
+	value, err, _ := p.resolveGroup.Do(bootIndexDigest, func() (any, error) {
+		if cached, ok := p.loadResolvedTemplate(bootIndexDigest); ok {
+			return cached, nil
+		}
+		resolved, resolveErr := p.resolveBoot(ctx, bootIndexDigest)
+		if resolveErr != nil && strings.TrimSpace(entry.SourceRef) != "" {
+			resolved, resolveErr = p.resolveLazy(ctx, entry)
+		}
+		if resolveErr != nil {
+			return nil, fmt.Errorf(
+				"resolve template %s boot index %s: %w",
+				entry.BootIndexDigest,
+				bootIndexDigest,
+				resolveErr,
+			)
+		}
+		if resolved.BootIndexDigest != bootIndexDigest {
+			return nil, fmt.Errorf(
+				"resolved boot index digest %s does not match template digest %s",
+				resolved.BootIndexDigest,
+				bootIndexDigest,
+			)
+		}
+		cached := resolvedTemplateCache{resolved: resolved, entry: entry}
+		p.resolveCache.Store(bootIndexDigest, cached)
+		return cached, nil
+	})
 	if err != nil {
-		return conchimage.ResolvedBoot{}, template.Entry{}, fmt.Errorf(
-			"resolve template %s boot index %s: %w",
-			entry.BootIndexDigest,
-			bootIndexDigest,
-			err,
-		)
+		return conchimage.ResolvedBoot{}, template.Entry{}, err
 	}
-	if resolved.BootIndexDigest != bootIndexDigest {
-		return conchimage.ResolvedBoot{}, template.Entry{}, fmt.Errorf(
-			"resolved boot index digest %s does not match template digest %s",
-			resolved.BootIndexDigest,
-			bootIndexDigest,
-		)
+	cached := value.(resolvedTemplateCache)
+	return cached.resolved, cached.entry, nil
+}
+
+func (p *bootPreparer) loadResolvedTemplate(bootIndexDigest string) (resolvedTemplateCache, bool) {
+	cached, ok := p.resolveCache.Load(bootIndexDigest)
+	if !ok {
+		return resolvedTemplateCache{}, false
 	}
-	return resolved, entry, nil
+	result := cached.(resolvedTemplateCache)
+	if !result.resolved.ExternalMemoryErofsPathOK() {
+		p.resolveCache.Delete(bootIndexDigest)
+		return resolvedTemplateCache{}, false
+	}
+	return result, true
 }
 
 func (p *bootPreparer) prepareResolvedBoot(
@@ -183,9 +276,10 @@ func (p *bootPreparer) prepareResolvedBoot(
 		memorySizeMB = resolved.MemorySizeMB
 	}
 	layoutReq := snapshot.BootLayoutRequest{
-		Parents:      parents,
-		MemoryLayout: memoryLayout,
-		MemorySizeMB: memorySizeMB,
+		Parents:             parents,
+		MemoryLayout:        memoryLayout,
+		MemorySizeMB:        memorySizeMB,
+		CheckpointErofsPath: resolved.ExternalMemoryErofsPath,
 	}
 	var layout *snapshot.BootLayout
 	if resume {
@@ -200,8 +294,15 @@ func (p *bootPreparer) prepareResolvedBoot(
 	if strings.TrimSpace(layout.MemMount) != "" {
 		runtimeMemKey = snapshot.MemKeyFromRootfs(key)
 	}
+	spec := bootSpecFromLayout(layout)
+	spec.PreGateKey = resolved.BootIndexDigest
+	spec.PreGateRequired = resolved.PreGateRequired
+	spec.PreGateProfile = append([]byte(nil), resolved.PreGateProfile...)
+	spec.MaterializeCritical = resolved.MaterializeCritical
+	spec.MaterializeAll = resolved.MaterializeAll
+	spec.MaterializeCommit = resolved.MaterializeCommit
 	return PreparedBoot{
-		Spec: bootSpecFromLayout(layout),
+		Spec: spec,
 		Runtime: BootRuntime{
 			BootIndexDigest: resolved.BootIndexDigest,
 			CapturedVMMName: resolved.VMMName,
@@ -243,6 +344,9 @@ func memoryLayoutForVMM(vmmName string, resume bool) (snapshot.MemoryLayoutMode,
 }
 
 func validateResolvedBoot(resolved conchimage.ResolvedBoot, expectedMode template.BootMode, requestedVMM string) error {
+	if resolved.PreGateRequired && !resolved.Resume {
+		return fmt.Errorf("cold boot cannot require memory pre-gate materialization")
+	}
 	if strings.TrimSpace(resolved.RootfsKey) == "" || strings.TrimSpace(resolved.VMKey) == "" {
 		return fmt.Errorf("boot index unpack returned incomplete parents")
 	}
@@ -308,5 +412,6 @@ func BootSpecFromRuntime(runtime BootRuntime) BootSpec {
 		KernelPath:   filepath.Join(runtime.VMMount, common.VmKernelRelativePath),
 		InitrdPath:   filepath.Join(runtime.VMMount, common.VmInitrdRelativePath),
 		SnapfilePath: snapfilePath,
+		PreGateKey:   runtime.BootIndexDigest,
 	}
 }

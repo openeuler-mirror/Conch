@@ -4,7 +4,10 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/opencontainers/go-digest"
 
@@ -83,10 +86,29 @@ func TestBootPreparerStratovirtColdCreateUsesNoMemoryLayer(t *testing.T) {
 	}
 }
 
+func TestBootPreparerRejectsPreGateForColdBoot(t *testing.T) {
+	templates, entry, bootDigest := newBootTemplate(t, template.OriginImage, template.BootModeCold)
+	resolved := resolvedBoot(bootDigest, false, "")
+	resolved.PreGateRequired = true
+	resolver := &fakeBootResolver{result: resolved}
+
+	_, err := mustBootPreparer(t, templates, &fakeSnapshotBackend{}, resolver).Prepare(context.Background(), PrepareBootRequest{
+		TemplateID: entry.BootIndexDigest,
+		SandboxID:  "sandbox-cold-pre-gate",
+		VMMName:    "stratovirt",
+		RAMMB:      512,
+	})
+	if err == nil || !strings.Contains(err.Error(), "cold boot cannot require") {
+		t.Fatalf("Prepare() error = %v, want cold pre-gate rejection", err)
+	}
+}
+
 func TestBootPreparerResumeRestoresResolvedBootIndex(t *testing.T) {
 	ctx := context.Background()
 	templates, entry, bootDigest := newBootTemplate(t, template.OriginCheckpoint, template.BootModeResume)
-	resolver := &fakeBootResolver{result: resolvedBoot(bootDigest, true, "cloud-hypervisor")}
+	resolved := resolvedBoot(bootDigest, true, "cloud-hypervisor")
+	resolved.PreGateRequired = true
+	resolver := &fakeBootResolver{result: resolved}
 	snapshots := &fakeSnapshotBackend{}
 	preparer := mustBootPreparer(t, templates, snapshots, resolver)
 
@@ -118,6 +140,9 @@ func TestBootPreparerResumeRestoresResolvedBootIndex(t *testing.T) {
 	if got.Spec.SnapfilePath == "" {
 		t.Fatalf("resume boot = %#v", got)
 	}
+	if !got.Spec.PreGateRequired {
+		t.Fatal("resume boot dropped pending memory materialization state")
+	}
 }
 
 func TestBootPreparerRejectsMissingBootIndexDigest(t *testing.T) {
@@ -138,6 +163,52 @@ func TestBootPreparerRejectsMissingBootIndexDigest(t *testing.T) {
 	}
 	if len(resolver.requests) != 0 || snapshots.callCount() != 0 {
 		t.Fatalf("backends called for missing digest: resolver=%#v snapshots=%#v", resolver.requests, snapshots)
+	}
+}
+
+func TestBootPreparerCoalescesConcurrentTemplateResolution(t *testing.T) {
+	templates, _, bootDigest := newBootTemplate(t, template.OriginCheckpoint, template.BootModeResume)
+	resolved := resolvedBoot(bootDigest, true, "stratovirt")
+	var calls atomic.Int32
+	resolverStarted := make(chan struct{})
+	releaseResolver := make(chan struct{})
+	var startedOnce sync.Once
+	preparer, err := newBootPreparer(templates, &fakeSnapshotBackend{}, func(_ context.Context, _ string) (conchimage.ResolvedBoot, error) {
+		calls.Add(1)
+		startedOnce.Do(func() { close(resolverStarted) })
+		<-releaseResolver
+		return resolved, nil
+	})
+	if err != nil {
+		t.Fatalf("newBootPreparer() error = %v", err)
+	}
+	preparer.(*bootPreparer).preGate = true
+	preparer.(*bootPreparer).resolveLazy = func(context.Context, template.Entry) (conchimage.ResolvedBoot, error) {
+		t.Fatal("lazy resolver called after regular resolution succeeded")
+		return conchimage.ResolvedBoot{}, nil
+	}
+
+	const concurrency = 50
+	start := make(chan struct{})
+	errs := make(chan error, concurrency)
+	for range concurrency {
+		go func() {
+			<-start
+			_, _, resolveErr := preparer.(*bootPreparer).resolveTemplate(context.Background(), bootDigest)
+			errs <- resolveErr
+		}()
+	}
+	close(start)
+	<-resolverStarted
+	time.Sleep(50 * time.Millisecond)
+	close(releaseResolver)
+	for range concurrency {
+		if resolveErr := <-errs; resolveErr != nil {
+			t.Fatalf("resolveTemplate() error = %v", resolveErr)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("resolver calls = %d, want 1", got)
 	}
 }
 
@@ -250,6 +321,8 @@ func TestBootPreparerCreatesDistinctRuntimeHandlesFromSharedCommittedParents(t *
 		second.Spec.MemoryPath != "" || second.Spec.SnapfilePath == "" {
 		t.Fatalf("StratoVirt restore specs = %#v %#v", first.Spec, second.Spec)
 	}
+	// With pre-gate disabled, each sandbox follows the original resolve path
+	// while still receiving its own boot layout (asserted above).
 	if len(resolver.requests) != 2 {
 		t.Fatalf("Boot resolver count = %d, want 2", len(resolver.requests))
 	}
