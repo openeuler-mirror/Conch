@@ -1,0 +1,3 @@
+*.o
+/shrink-preheat-daemon
+/test_client
