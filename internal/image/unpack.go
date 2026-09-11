@@ -2,56 +2,86 @@ package image
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
+	"sync"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/snapshots"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/platforms"
 	"github.com/opencontainers/image-spec/identity"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
+	containerdclient "github.com/openeuler/Conch/internal/adapters/containerd/client"
+	"github.com/openeuler/Conch/internal/image/erofsconvert"
 	"github.com/openeuler/Conch/pkg/ulog"
 )
 
 const (
-	SnapshotLabelMemSnapshot = "conch/snapshotter/mem-snapshot"
-	SnapshotLabelVMSnapshot  = "conch/snapshotter/vm-snapshot"
-
 	KindRootfs      = "rootfs"
 	KindSandbox     = "sandbox"
 	KindMemSnapshot = "mem-snapshot"
 	KindUnknown     = "unknown"
 )
 
-// UnpackAllSubImages parses OCI Image Index, unpacks all child manifests,
-// returns sub-image type (io.conch.kind) to snapshot ChainID mapping.
-// On error, cleans up any snapshots already unpacked to avoid resource leakage.
-//
-// The image must be fully pulled before calling: all content (manifests, configs,
-// layers) must exist in the content store. RootFS reads from the image config.
-func UnpackAllSubImages(ctx context.Context, client *containerd.Client, imageName string) (snapshotMap map[string]string, err error) {
-	snapshotMap = make(map[string]string)
-	var createdSnapshotIDs []string
-	snapshotter := client.SnapshotService("overlayfs")
-	defer func() {
-		if err != nil {
-			cleanupSnapshots(createdSnapshotIDs, snapshotter, ctx)
-		}
-	}()
+var ErrMissingSandbox = errors.New("missing required sandbox component")
 
-	index, err := getImageIndex(ctx, client, imageName)
-	if err != nil {
-		return nil, err
+type unpackLock struct {
+	token chan struct{}
+	refs  int
+}
+
+type unpackLockSet struct {
+	mu    sync.Mutex
+	locks map[string]*unpackLock
+}
+
+var componentUnpackLocks = unpackLockSet{locks: make(map[string]*unpackLock)}
+
+// UnpackBootIndex validates a Boot Index by its immutable digest and unpacks
+// all component manifests.
+//
+// The Boot Index must be fully available locally before calling: all content
+// (manifests, configs, and layers) must exist in the content store.
+func UnpackBootIndex(ctx context.Context, client *containerdclient.Client, bootIndexDigest string) error {
+	return withBootIndexLease(ctx, client, bootIndexDigest, func(operationCtx context.Context) error {
+		unpackCtx, info, err := inspectBootIndex(operationCtx, client, bootIndexDigest)
+		if err != nil {
+			return err
+		}
+		if _, err := unpackBootIndexComponents(unpackCtx, client.Client, info); err != nil {
+			return fmt.Errorf("unpack boot index %s: %w", info.BootIndexDigest, err)
+		}
+		return nil
+	})
+}
+
+func unpackBootIndexComponents(ctx context.Context, client *containerd.Client, info BootIndexInfo) (map[string]string, error) {
+	if client == nil {
+		return nil, fmt.Errorf("containerd client is required")
 	}
 
-	ulog.Info("Found manifests in index, starting unpack",
-		ulog.F("count", len(index.Manifests)))
+	snapshotMap := make(map[string]string)
 
-	for _, manifestDesc := range index.Manifests {
+	components := []ocispec.Descriptor{info.RootfsDescriptor}
+	if info.MemDescriptor.Digest != "" {
+		components = append(components, info.MemDescriptor)
+	}
+	components = append(components, info.SandboxDescriptor)
+	ulog.Info("Found components in Boot Index, starting unpack",
+		ulog.F("count", len(components)))
+
+	for _, manifestDesc := range components {
 		kind := getKind(manifestDesc)
-		snapshotID, err := unpackOneSubImage(ctx, client, snapshotter, manifestDesc, kind, &createdSnapshotIDs)
+		subImageName := fmt.Sprintf("localhost/conch/%s-component:%s", kind, manifestDesc.Digest.Encoded())
+		if err := validateNativeComponentManifest(ctx, client, kind, manifestDesc); err != nil {
+			return nil, err
+		}
+		if err := ensureSubImage(ctx, client, subImageName, manifestDesc, kind); err != nil {
+			return nil, err
+		}
+		snapshotID, err := unpackOneSubImage(ctx, client, "erofs", manifestDesc, kind, subImageName)
 		if err != nil {
 			return nil, err
 		}
@@ -61,67 +91,7 @@ func UnpackAllSubImages(ctx context.Context, client *containerd.Client, imageNam
 			ulog.F("snapshot_id", snapshotID))
 	}
 
-	if err := validateRequiredKinds(snapshotMap); err != nil {
-		return nil, err
-	}
-
-	if err = linkSnapshotLabels(ctx, snapshotter, snapshotMap); err != nil {
-		return nil, err
-	}
 	return snapshotMap, nil
-}
-
-func cleanupSnapshots(createdSnapshotIDs []string, snapshotter snapshots.Snapshotter, ctx context.Context) {
-	for _, sid := range createdSnapshotIDs {
-		if removeErr := snapshotter.Remove(ctx, sid); removeErr != nil {
-			ulog.Warn("Cleanup snapshot on error",
-				ulog.F("snapshot_id", sid),
-				ulog.F("error", removeErr))
-		}
-	}
-}
-
-func getImageIndex(ctx context.Context, client *containerd.Client, imageName string) (*ocispec.Index, error) {
-	img, err := client.GetImage(ctx, imageName)
-	if err != nil {
-		return nil, fmt.Errorf("get image %s: %w", imageName, err)
-	}
-
-	target := img.Target()
-	if target.MediaType != ocispec.MediaTypeImageIndex {
-		return nil, fmt.Errorf("image %s is not an OCI Image Index (mediaType: %s)", imageName, target.MediaType)
-	}
-
-	indexData, err := content.ReadBlob(ctx, client.ContentStore(), target)
-	if err != nil {
-		return nil, fmt.Errorf("read index content: %w", err)
-	}
-
-	var index ocispec.Index
-	if err := json.Unmarshal(indexData, &index); err != nil {
-		return nil, fmt.Errorf("unmarshal index JSON: %w", err)
-	}
-	return &index, nil
-}
-
-// ValidateConchImageIndex verifies that the image is a Conch native OCI index
-// containing at least rootfs and sandbox components.
-func ValidateConchImageIndex(ctx context.Context, client *containerd.Client, imageName string) error {
-	index, err := getImageIndex(ctx, client, imageName)
-	if err != nil {
-		return err
-	}
-
-	kinds := make(map[string]string, len(index.Manifests))
-	for _, manifestDesc := range index.Manifests {
-		kind := getKind(manifestDesc)
-		if kind == KindUnknown {
-			continue
-		}
-		kinds[kind] = manifestDesc.Digest.String()
-	}
-
-	return validateRequiredKinds(kinds)
 }
 
 func getKind(manifestDesc ocispec.Descriptor) string {
@@ -131,20 +101,9 @@ func getKind(manifestDesc ocispec.Descriptor) string {
 	return KindUnknown
 }
 
-func validateRequiredKinds(snapshotMap map[string]string) error {
-	if snapshotMap[KindRootfs] == "" {
-		return fmt.Errorf("boot index missing required kind %q", KindRootfs)
-	}
-	if snapshotMap[KindSandbox] == "" {
-		return fmt.Errorf("boot index missing required kind %q", KindSandbox)
-	}
-	// KindMemSnapshot is optional for normal boot images and required only for snapshot images.
-	return nil
-}
-
-func unpackOneSubImage(ctx context.Context, client *containerd.Client, snapshotter snapshots.Snapshotter, manifestDesc ocispec.Descriptor, kind string, createdSnapshotIDs *[]string) (string, error) {
+func unpackOneSubImage(ctx context.Context, client *containerd.Client, snapshotterName string, manifestDesc ocispec.Descriptor, kind string, imageName string) (string, error) {
 	subImg := containerd.NewImage(client, images.Image{
-		Name:   fmt.Sprintf("temp-unpack-%s", manifestDesc.Digest.Encoded()[:12]),
+		Name:   imageName,
 		Target: manifestDesc,
 	})
 
@@ -153,43 +112,100 @@ func unpackOneSubImage(ctx context.Context, client *containerd.Client, snapshott
 		return "", fmt.Errorf("get RootFS for %s: %w", kind, err)
 	}
 	snapshotID := identity.ChainID(diffIDs).String()
-
-	if err := subImg.Unpack(ctx, "overlayfs"); err != nil {
+	if err := serializeUnpack(ctx, snapshotterName, snapshotID, func() error {
+		return subImg.Unpack(ctx, snapshotterName)
+	}); err != nil {
 		return "", fmt.Errorf("unpack sub-image %s (kind: %s): %w", manifestDesc.Digest, kind, err)
 	}
-
-	// Verify the snapshot was created with the expected ChainID (containerd uses this as the snapshot name)
-	if _, err := snapshotter.Stat(ctx, snapshotID); err != nil {
-		return "", fmt.Errorf("verify unpacked snapshot %s for %s: %w", snapshotID, kind, err)
-	}
-	*createdSnapshotIDs = append(*createdSnapshotIDs, snapshotID)
 	return snapshotID, nil
 }
 
-func linkSnapshotLabels(ctx context.Context, snapshotter snapshots.Snapshotter, snapshotMap map[string]string) error {
-	rootfsSID := snapshotMap[KindRootfs]
-	sandboxSID := snapshotMap[KindSandbox]
-	memSID := snapshotMap[KindMemSnapshot]
-	if rootfsSID == "" || sandboxSID == "" {
-		return fmt.Errorf("cannot link snapshot labels: need rootfs and sandbox kinds")
-	}
-
-	labels := make(map[string]string)
-	fieldpaths := []string{}
-	if sandboxSID != "" {
-		labels[SnapshotLabelVMSnapshot] = sandboxSID
-		fieldpaths = append(fieldpaths, "labels."+SnapshotLabelVMSnapshot)
-	}
-	if memSID != "" {
-		labels[SnapshotLabelMemSnapshot] = memSID
-		fieldpaths = append(fieldpaths, "labels."+SnapshotLabelMemSnapshot)
-	}
-	_, err := snapshotter.Update(ctx, snapshots.Info{
-		Name:   rootfsSID,
-		Labels: labels,
-	}, fieldpaths...)
+func serializeUnpack(ctx context.Context, snapshotter, chainID string, unpack func() error) error {
+	key := fmt.Sprintf("sn://%s/%s", snapshotter, chainID)
+	unlock, err := componentUnpackLocks.lock(ctx, key)
 	if err != nil {
-		return fmt.Errorf("failed to link component SnapshotIDs to rootfs: %w", err)
+		return err
+	}
+	defer unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return unpack()
+}
+
+func (s *unpackLockSet) lock(ctx context.Context, key string) (func(), error) {
+	s.mu.Lock()
+	entry := s.locks[key]
+	if entry == nil {
+		entry = &unpackLock{token: make(chan struct{}, 1)}
+		s.locks[key] = entry
+	}
+	entry.refs++
+	s.mu.Unlock()
+
+	select {
+	case entry.token <- struct{}{}:
+		return func() {
+			<-entry.token
+			s.release(key, entry)
+		}, nil
+	case <-ctx.Done():
+		s.release(key, entry)
+		return nil, ctx.Err()
+	}
+}
+
+func (s *unpackLockSet) release(key string, entry *unpackLock) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry.refs--
+	if entry.refs == 0 {
+		delete(s.locks, key)
+	}
+}
+
+func isNativeErofsKind(kind string) bool {
+	return kind == KindRootfs || kind == KindMemSnapshot || kind == KindSandbox
+}
+
+func validateNativeComponentManifest(ctx context.Context, client *containerd.Client, kind string, manifestDesc ocispec.Descriptor) error {
+	manifest, err := images.Manifest(ctx, client.ContentStore(), manifestDesc, platforms.DefaultStrict())
+	if err != nil {
+		return fmt.Errorf("resolve native %s manifest: %w", kind, err)
+	}
+	if kind == KindRootfs {
+		if _, err := erofsconvert.ValidateNativeLayers(manifest.Layers, erofsconvert.DefaultAlignBytes); err != nil {
+			return fmt.Errorf("%s component is not native erofs: %w", kind, err)
+		}
+		return nil
+	}
+	if len(manifest.Layers) == 0 {
+		return fmt.Errorf("%s component is not native erofs: manifest has no layers", kind)
+	}
+	for _, layer := range manifest.Layers {
+		if layer.MediaType != erofsconvert.NativeLayerMediaType {
+			return fmt.Errorf("%s component is not native erofs: layer %s media type %s is not %s", kind, layer.Digest, layer.MediaType, erofsconvert.NativeLayerMediaType)
+		}
+		if layer.Size <= 0 {
+			return fmt.Errorf("%s component is not native erofs: layer %s size %d is invalid", kind, layer.Digest, layer.Size)
+		}
 	}
 	return nil
+}
+
+func ensureSubImage(ctx context.Context, client *containerd.Client, imageName string, target ocispec.Descriptor, componentKind string) error {
+	if imageName == "" {
+		return fmt.Errorf("sub-image name is required")
+	}
+	_, err := client.ImageService().Create(ctx, images.Image{
+		Name:   imageName,
+		Target: target,
+		Labels: map[string]string{
+			ImageKindLabel: componentImageKind(componentKind),
+		},
+	})
+	if err == nil || errdefs.IsAlreadyExists(err) {
+		return nil
+	}
+	return fmt.Errorf("create sub-image record %s: %w", imageName, err)
 }

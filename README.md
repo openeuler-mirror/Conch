@@ -1,6 +1,6 @@
 <img src="./docs/assets/Conch-logo.jpg" alt="Conch logo" style="width:200px;" />
 
-<a href="https://atomgit.com/openeuler/Conch.git"><img src="https://img.shields.io/badge/atomgit-Conch-blue"/></a> ![license](https://img.shields.io/badge/license-Mulan%20PSL%20v2-blue) <a href="https://go.dev/"><img src="https://img.shields.io/badge/Go-1.23+-blue"/> </a><a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-SDK-blue"/> </a>
+<a href="https://atomgit.com/openeuler/Conch.git"><img src="https://img.shields.io/badge/atomgit-Conch-blue"/></a> ![license](https://img.shields.io/badge/license-Mulan%20PSL%20v2-blue) <a href="https://go.dev/"><img src="https://img.shields.io/badge/Go-1.26+-blue"/> </a><a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-SDK-blue"/> </a>
 
 # Conch - Agent Sandbox Engine
 
@@ -15,75 +15,17 @@ Conch 是一个基于 Go 开发的容器沙箱引擎，能够适用于 Agent 对
 
 - 轻量安全隔离 -- 支持虚拟沙箱，对 Agent 任务进行安全隔离。支持完整的生命周期管理，包括创建、暂停、恢复和删除等操作。
 - 快照启动加速 -- 支持虚拟机内存和根文件系统的快照功能。通过快照机制，可以实现秒级的沙箱启动，显著提升大规模部署场景下的资源利用效率。快照采用写时复制（Copy-on-Write）技术，最小化存储开销。
-- 精简容器网络 -- 通过 veth 设备和 NAT 规则实现网络隔离和地址转换，支持容器网络池化复用，降低启动时延。
+- 精简容器网络 -- 通过 CNI 插件管理沙箱网络命名空间的外层网络，同时由 Conch 保留可复用 slot、netns 生命周期、VM guest tap 和 guest NAT 的管理权，在保持网络池化低时延的同时明确外层网络边界。
 
-## 快速开始
+## 文档
 
-### 环境要求
+- [快速开始](docs/user/getting-started.md)
+- [环境准备](docs/user/environment-setup.md)
+- [RPM 安装](docs/user/rpm-install.md)
+- [Template 与镜像](docs/user/template.md)
+- [Python SDK](docs/user/python-sdk.md)
 
-- Go 1.23+
-- Containerd 2.2.1+
-- Cloud-Hypervisor v48.0+
-- Iptables 网络配置工具
-- Linux 5.10+
-
-### 一键编译安装
-
-
-```bash
-# 克隆代码仓库
-git clone https://atomgit.com/openeuler/Conch.git
-cd Conch
-git checkout demo
-
-# 一键执行全流程
-./scripts/conch-env-setup.sh all
-
-pip install -e ./sdk
-```
-
-### 运行服务
-
-编译完成后，二进制文件位于 `bin/` 目录下，通过以下命令启动conchd服务：
-
-```bash
-./bin/conchd
-```
-
-### 镜像管理
-
-Conch 提供统一的镜像管理命令，用于构建、发布、拉取和解包 Conch 镜像：
-
-```bash
-conch build -f Dockerfile -t localhost/demo-sandbox:latest .
-conch push localhost/demo-sandbox:latest hub.oepkgs.net/conch/demo-sandbox:latest
-conch pull hub.oepkgs.net/conch/demo-sandbox:latest
-conch pull docker.io/library/nginx:latest
-
-# 本地已有 Conch 镜像时可单独解包
-conch unpack hub.oepkgs.net/conch/conch-index:v0.1
-```
-
-其中 `conch pull` 会在拉取后自动完成本地 unpack；`conch unpack` 主要用于本地已有 Conch 镜像时单独解包或排障。
-
-详细用法见 [Conch Image Guide](docs/guide/image.md)。
-
-### Python SDK 示例
-```python
-from conch import Sandbox
-
-try:
-    sandbox = Sandbox.create()
-    print(f"Sandbox created: {sandbox.sandbox_id}")
-    result = sandbox.execute(cmd="python3", content="print('hello Conch!')")
-    print(result)
-except RuntimeError as e:
-    print(f"Error: {e}")
-finally:
-    sandbox.delete()
-```
-
-调用 `execute()` 之前必须先成功执行 `Sandbox.create()` 类方法，并确保 `./bin/conchd` 已经启动；否则 `Sandbox` 实例还没有关联到可用的 Agent client。
+其他文档见 [Conch 文档导航](docs/README.md)。
 
 ## 许可证
 

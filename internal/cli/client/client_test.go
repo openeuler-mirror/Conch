@@ -1,0 +1,542 @@
+package client
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+	"time"
+)
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
+
+func newTestClient(t *testing.T, opts Options) *Client {
+	t.Helper()
+	client, err := New(opts)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	return client
+}
+
+func TestImageAPIMethods(t *testing.T) {
+	var pullReq PullImageRequest
+	var listReq ListImagesRequest
+	var removeReq RemoveImageRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case pullImage:
+			if err := json.NewDecoder(r.Body).Decode(&pullReq); err != nil {
+				t.Fatalf("decode pull request: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		case listImages:
+			if err := json.NewDecoder(r.Body).Decode(&listReq); err != nil {
+				t.Fatalf("decode list request: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(listImagesResponse{Images: []ImageRecord{{
+				Name:         "localhost/conch/demo:latest",
+				TargetDigest: "sha256:demo",
+				RepoDigests:  []string{"localhost/conch/demo@sha256:demo"},
+				Size:         42,
+				Kind:         "boot-index-cold",
+			}}})
+		case removeImage:
+			if err := json.NewDecoder(r.Body).Decode(&removeReq); err != nil {
+				t.Fatalf("decode remove request: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	c := newTestClient(t, Options{BaseURL: server.URL})
+	if err := c.PullImage(context.Background(), PullImageRequest{
+		ImageName: "docker.io/library/nginx:latest",
+	}); err != nil {
+		t.Fatalf("PullImage: %v", err)
+	}
+	if pullReq.ImageName != "docker.io/library/nginx:latest" {
+		t.Fatalf("pull request = %#v", pullReq)
+	}
+
+	images, err := c.ListImages(context.Background(), ListImagesRequest{
+		Filters: []string{"name==localhost/conch/demo:latest"},
+	})
+	if err != nil {
+		t.Fatalf("ListImages: %v", err)
+	}
+	if len(listReq.Filters) != 1 {
+		t.Fatalf("list request = %#v", listReq)
+	}
+	if len(images) != 1 || images[0].Name != "localhost/conch/demo:latest" {
+		t.Fatalf("images = %#v", images)
+	}
+	if images[0].Kind != "boot-index-cold" {
+		t.Fatalf("image kind = %q, want boot-index-cold", images[0].Kind)
+	}
+	if len(images[0].RepoDigests) != 1 || images[0].RepoDigests[0] != "localhost/conch/demo@sha256:demo" {
+		t.Fatalf("image repo digests = %#v", images[0].RepoDigests)
+	}
+
+	if err := c.RemoveImage(context.Background(), RemoveImageRequest{
+		ImageName:   "localhost/conch/demo:latest",
+		Synchronous: true,
+	}); err != nil {
+		t.Fatalf("RemoveImage: %v", err)
+	}
+	if removeReq.ImageName != "localhost/conch/demo:latest" || !removeReq.Synchronous {
+		t.Fatalf("remove request = %#v", removeReq)
+	}
+}
+
+func TestImageAPIErrorIncludesStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "bad image", http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	c := newTestClient(t, Options{BaseURL: server.URL})
+	err := c.PullImage(context.Background(), PullImageRequest{ImageName: "bad"})
+	if err == nil {
+		t.Fatal("PullImage() error = nil")
+	}
+	if !strings.Contains(err.Error(), "status 400") {
+		t.Fatalf("error = %v, want status 400", err)
+	}
+}
+
+func TestAPIErrorParsesStructuredResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"status":"error","code":"image.invalid_argument","error":"invalid image argument"}`)
+	}))
+	defer server.Close()
+
+	c := newTestClient(t, Options{BaseURL: server.URL})
+	err := c.PullImage(context.Background(), PullImageRequest{ImageName: "bad"})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %v, want *APIError", err)
+	}
+	if apiErr.StatusCode != http.StatusBadRequest || apiErr.Code != "image.invalid_argument" || apiErr.Message != "invalid image argument" {
+		t.Fatalf("APIError = %#v", apiErr)
+	}
+}
+
+func TestConchAPITimeoutEnv(t *testing.T) {
+	t.Setenv("CONCH_API_TIMEOUT", "5m")
+	c := newTestClient(t, Options{BaseURL: "http://127.0.0.1:4063"})
+	if c.httpClient.Timeout != 5*time.Minute {
+		t.Fatalf("timeout = %s, want 5m", c.httpClient.Timeout)
+	}
+
+	t.Setenv("CONCH_API_TIMEOUT", "bad")
+	c = newTestClient(t, Options{BaseURL: "http://127.0.0.1:4063"})
+	if c.httpClient.Timeout != defaultHTTPTimeout {
+		t.Fatalf("timeout = %s, want default %s", c.httpClient.Timeout, defaultHTTPTimeout)
+	}
+}
+
+func TestConchAPITimeoutOverride(t *testing.T) {
+	t.Setenv("CONCH_API_TIMEOUT", "5m")
+	c := newTestClient(t, Options{BaseURL: "http://127.0.0.1:4063", Timeout: 10 * time.Minute})
+	if c.httpClient.Timeout != 10*time.Minute {
+		t.Fatalf("timeout = %s, want 10m", c.httpClient.Timeout)
+	}
+}
+
+func TestNewRejectsInvalidYAML(t *testing.T) {
+	configPath := t.TempDir() + "/config.yaml"
+	if err := os.WriteFile(configPath, []byte("server: [\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	c, err := New(Options{BaseURL: "http://127.0.0.1:4063", ConfigPath: configPath})
+	if err == nil {
+		t.Fatal("New() error = nil")
+	}
+	if c != nil {
+		t.Fatalf("New() client = %#v, want nil", c)
+	}
+	if !strings.Contains(err.Error(), "failed to parse config file") {
+		t.Fatalf("NewClientWithConfig() error = %v, want YAML parse error", err)
+	}
+}
+
+func TestNewRejectsMissingExplicitConfigFile(t *testing.T) {
+	configPath := t.TempDir() + "/missing.yaml"
+	c, err := New(Options{ConfigPath: configPath})
+	if err == nil {
+		t.Fatal("New() error = nil")
+	}
+	if c != nil {
+		t.Fatalf("New() client = %#v, want nil", c)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("New() error = %v, want os.ErrNotExist", err)
+	}
+}
+
+func TestTemplateAndSnapshotDebugAPIMethods(t *testing.T) {
+	kernel, err := os.CreateTemp(t.TempDir(), "kernel-*")
+	if err != nil {
+		t.Fatalf("CreateTemp kernel: %v", err)
+	}
+	if _, err := kernel.WriteString("kernel-content"); err != nil {
+		t.Fatalf("write kernel: %v", err)
+	}
+	if err := kernel.Close(); err != nil {
+		t.Fatalf("close kernel: %v", err)
+	}
+	initrd, err := os.CreateTemp(t.TempDir(), "initrd-*")
+	if err != nil {
+		t.Fatalf("CreateTemp initrd: %v", err)
+	}
+	if _, err := initrd.WriteString("initrd-content"); err != nil {
+		t.Fatalf("write initrd: %v", err)
+	}
+	if err := initrd.Close(); err != nil {
+		t.Fatalf("close initrd: %v", err)
+	}
+
+	var templateMetadata TemplateCreateMetadata
+	var listSnapshotsReq ListSnapshotsRequest
+	var removeSnapshotReq RemoveSnapshotRequest
+	var templateKernelBody string
+	var templateInitrdBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case createTemplate:
+			if err := r.ParseMultipartForm(4096); err != nil {
+				t.Fatalf("ParseMultipartForm: %v", err)
+			}
+			if err := json.Unmarshal([]byte(r.FormValue("metadata")), &templateMetadata); err != nil {
+				t.Fatalf("decode template metadata: %v", err)
+			}
+			file, _, err := r.FormFile("kernel")
+			if err != nil {
+				t.Fatalf("template kernel FormFile: %v", err)
+			}
+			raw, err := io.ReadAll(file)
+			_ = file.Close()
+			if err != nil {
+				t.Fatalf("ReadAll template kernel: %v", err)
+			}
+			templateKernelBody = string(raw)
+			file, _, err = r.FormFile("initrd")
+			if err != nil {
+				t.Fatalf("template initrd FormFile: %v", err)
+			}
+			raw, err = io.ReadAll(file)
+			_ = file.Close()
+			if err != nil {
+				t.Fatalf("ReadAll template initrd: %v", err)
+			}
+			templateInitrdBody = string(raw)
+			_ = json.NewEncoder(w).Encode(TemplateCreateResponse{
+				Status:       "ok",
+				TemplateName: "registry.example/conch/test:latest",
+				TemplateID:   "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			})
+		case listSnapshots:
+			if err := json.NewDecoder(r.Body).Decode(&listSnapshotsReq); err != nil {
+				t.Fatalf("decode snapshot list request: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(listSnapshotsResponse{Snapshots: []SnapshotRecord{{
+				Key:    "sha256:rootfs",
+				Kind:   "committed",
+				Parent: "sha256:parent",
+			}}})
+		case removeSnapshot:
+			if err := json.NewDecoder(r.Body).Decode(&removeSnapshotReq); err != nil {
+				t.Fatalf("decode snapshot remove request: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	c := newTestClient(t, Options{BaseURL: server.URL})
+	templateResp, err := c.CreateTemplate(context.Background(), TemplateCreateRequest{
+		Name:       "registry.example/conch/test:latest",
+		Source:     "docker.io/library/busybox:latest",
+		KernelPath: kernel.Name(),
+		InitrdPath: initrd.Name(),
+		PlainHTTP:  true,
+		Username:   "user",
+		Password:   "pass",
+		Labels:     map[string]string{"role": "base"},
+	})
+	if err != nil {
+		t.Fatalf("CreateTemplate: %v", err)
+	}
+	if templateMetadata.Name != "registry.example/conch/test:latest" || templateMetadata.Source != "docker.io/library/busybox:latest" || !templateMetadata.PlainHTTP || templateMetadata.Labels["role"] != "base" {
+		t.Fatalf("template metadata = %#v", templateMetadata)
+	}
+	if templateKernelBody != "kernel-content" || templateInitrdBody != "initrd-content" {
+		t.Fatalf("uploaded template bodies kernel=%q initrd=%q", templateKernelBody, templateInitrdBody)
+	}
+	if templateResp.TemplateID != "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+		t.Fatalf("template response = %#v", templateResp)
+	}
+
+	snapshots, err := c.ListSnapshots(context.Background(), ListSnapshotsRequest{
+		Filters: []string{"kind==committed"},
+	})
+	if err != nil {
+		t.Fatalf("ListSnapshots: %v", err)
+	}
+	if len(listSnapshotsReq.Filters) != 1 {
+		t.Fatalf("snapshot list request = %#v", listSnapshotsReq)
+	}
+	if len(snapshots) != 1 || snapshots[0].Key != "sha256:rootfs" {
+		t.Fatalf("snapshots = %#v", snapshots)
+	}
+
+	if err := c.RemoveSnapshot(context.Background(), RemoveSnapshotRequest{
+		Key: "sha256:rootfs",
+	}); err != nil {
+		t.Fatalf("RemoveSnapshot: %v", err)
+	}
+	if removeSnapshotReq.Key != "sha256:rootfs" {
+		t.Fatalf("snapshot remove request = %#v", removeSnapshotReq)
+	}
+}
+
+func TestCheckpointSandboxRequest(t *testing.T) {
+	var got SandboxCheckpointRequest
+	c := newTestClient(t, Options{BaseURL: "http://example.invalid"})
+	c.httpClient = &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if r.URL.Path != checkpointSandbox {
+				t.Fatalf("path = %q, want %q", r.URL.Path, checkpointSandbox)
+			}
+			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(bytes.NewBufferString(`{"status":"ok","template_id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`)),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}
+
+	resp, err := c.CheckpointSandbox(context.Background(), SandboxCheckpointRequest{
+		SandboxID:    "sandbox-123",
+		TemplateName: "registry.example/conch/checkpoint:latest",
+	})
+	if err != nil {
+		t.Fatalf("CheckpointSandbox: %v", err)
+	}
+	if resp.TemplateID != "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+		t.Fatalf("TemplateID = %q", resp.TemplateID)
+	}
+	if got.SandboxID != "sandbox-123" {
+		t.Fatalf("sandbox_id = %q, want %q", got.SandboxID, "sandbox-123")
+	}
+	if got.TemplateName != "registry.example/conch/checkpoint:latest" {
+		t.Fatalf("template_name = %q", got.TemplateName)
+	}
+}
+
+func TestTemplateRecordIncludesNameAndIDInJSON(t *testing.T) {
+	const payload = `{"name":"registry.example/conch/test:latest","template_id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`
+	var record TemplateRecord
+	if err := json.Unmarshal([]byte(payload), &record); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if record.TemplateID != "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+		t.Fatalf("TemplateID = %q", record.TemplateID)
+	}
+	if record.Name != "registry.example/conch/test:latest" {
+		t.Fatalf("Name = %q", record.Name)
+	}
+	raw, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if !strings.Contains(string(raw), `"template_id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"`) {
+		t.Fatalf("TemplateRecord JSON = %s", raw)
+	}
+	for _, removedField := range []string{`"state"`, `"updated_at"`, `"last_error"`} {
+		if strings.Contains(string(raw), removedField) {
+			t.Fatalf("TemplateRecord JSON still contains removed field %s: %s", removedField, raw)
+		}
+	}
+}
+
+func TestTemplateDistributionAPIMethods(t *testing.T) {
+	var pullReq TemplatePullRequest
+	var pushReq TemplatePushRequest
+	var unpackReq TemplateUnpackRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case pullTemplate:
+			if err := json.NewDecoder(r.Body).Decode(&pullReq); err != nil {
+				t.Fatalf("decode pull request: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(TemplatePullResponse{
+				Status:       "ok",
+				TemplateName: "registry.example.invalid/conch/template:latest",
+				TemplateID:   "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			})
+		case pushTemplate:
+			if err := json.NewDecoder(r.Body).Decode(&pushReq); err != nil {
+				t.Fatalf("decode push request: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		case unpackTemplate:
+			if err := json.NewDecoder(r.Body).Decode(&unpackReq); err != nil {
+				t.Fatalf("decode unpack request: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	c := newTestClient(t, Options{BaseURL: server.URL})
+
+	pulled, err := c.PullTemplate(context.Background(), TemplatePullRequest{
+		Reference: "registry.example.invalid/conch/template:latest",
+		PlainHTTP: true,
+		Username:  "pull-user",
+		Password:  "pull-pass",
+		Labels:    map[string]string{"source": "registry"},
+	})
+	if err != nil {
+		t.Fatalf("PullTemplate() error = %v", err)
+	}
+	if pulled.TemplateID == "" || pulled.TemplateName != pullReq.Reference || !pullReq.PlainHTTP {
+		t.Fatalf("PullTemplate() response = %#v, request = %#v", pulled, pullReq)
+	}
+
+	if err := c.PushTemplate(context.Background(), TemplatePushRequest{
+		Name:            pulled.TemplateName,
+		RemoteReference: "mirror.example.invalid/conch/template:copy",
+		PlainHTTP:       true,
+		Username:        "push-user",
+		Password:        "push-pass",
+	}); err != nil {
+		t.Fatalf("PushTemplate() error = %v", err)
+	}
+	if pushReq.Name != pulled.TemplateName || pushReq.RemoteReference != "mirror.example.invalid/conch/template:copy" || !pushReq.PlainHTTP {
+		t.Fatalf("PushTemplate() request = %#v", pushReq)
+	}
+
+	if err := c.UnpackTemplate(context.Background(), TemplateUnpackRequest{Name: pulled.TemplateName}); err != nil {
+		t.Fatalf("UnpackTemplate() error = %v", err)
+	}
+	if unpackReq.Name != pulled.TemplateName {
+		t.Fatalf("UnpackTemplate() request = %#v", unpackReq)
+	}
+}
+
+func TestCreateSandboxIncludesExplicitRAM(t *testing.T) {
+	var got SandboxCreateRequest
+	c := newTestClient(t, Options{BaseURL: "http://example.invalid"})
+	c.httpClient = &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if r.URL.Path != createSandbox {
+				t.Fatalf("path = %q, want %q", r.URL.Path, createSandbox)
+			}
+			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(bytes.NewBufferString(`{"sandboxID":"sandbox-123","domain":"192.0.2.2"}`)),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}
+
+	_, err := c.CreateSandbox(context.Background(), SandboxCreateRequest{
+		TemplateName: "registry.example/conch/test:latest",
+		SandboxID:    "sandbox-123",
+		RAMMB:        4096,
+	})
+	if err != nil {
+		t.Fatalf("CreateSandbox: %v", err)
+	}
+	if got.TemplateName == "" || got.SandboxID != "sandbox-123" {
+		t.Fatalf("create request = %#v", got)
+	}
+	if got.RAMMB != 4096 {
+		t.Fatalf("ram_mb = %d, want 4096", got.RAMMB)
+	}
+	if got.VMMName != "" || got.VCPUNum != 0 {
+		t.Fatalf("unexpected client resource defaults = %#v", got)
+	}
+}
+
+func TestCreateSandboxOmitsEmptyTemplateSelector(t *testing.T) {
+	var body map[string]any
+	c := newTestClient(t, Options{BaseURL: "http://example.invalid"})
+	c.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewBufferString(`{"sandboxID":"sandbox-123","domain":"192.0.2.2"}`)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+
+	if _, err := c.CreateSandbox(context.Background(), SandboxCreateRequest{SandboxID: "sandbox-123"}); err != nil {
+		t.Fatalf("CreateSandbox: %v", err)
+	}
+	if _, ok := body["template_name"]; ok {
+		t.Fatalf("create request unexpectedly includes template_name: %#v", body)
+	}
+	if _, ok := body["template_id"]; ok {
+		t.Fatalf("create request unexpectedly includes template_id: %#v", body)
+	}
+}
+
+func TestSandboxListAndDeleteUseV1API(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			if r.URL.RequestURI() != listSandbox {
+				t.Fatalf("list request = %s %s", r.Method, r.URL.String())
+			}
+			_ = json.NewEncoder(w).Encode([]SandboxRecord{{SandboxID: "sandbox-1"}})
+		case http.MethodDelete:
+			if r.URL.Path != deleteSandbox+"sandbox-1" {
+				t.Fatalf("delete request = %s %s", r.Method, r.URL.String())
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	c := newTestClient(t, Options{BaseURL: server.URL})
+	records, err := c.ListSandboxes(context.Background())
+	if err != nil || len(records) != 1 || records[0].SandboxID != "sandbox-1" {
+		t.Fatalf("ListSandboxes() = %#v, %v", records, err)
+	}
+	if err := c.DeleteSandbox(context.Background(), "sandbox-1"); err != nil {
+		t.Fatalf("DeleteSandbox() error = %v", err)
+	}
+}

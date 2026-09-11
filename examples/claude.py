@@ -4,6 +4,7 @@ import os
 import sys
 import subprocess
 import time
+import ipaddress
 
 from conch import Sandbox
 
@@ -12,6 +13,7 @@ from conch import Sandbox
 #     export ANTHROPIC_API_KEY="your_key"
 #     export ANTHROPIC_BASE_URL="your_url"
 #     export CLAUDE_SSH_AUTHORIZED_KEYS="$(cat ~/.ssh/id_rsa.pub)"
+#     export CONCH_TEMPLATE_NAME="<template-name>"
 #   Option 2: Enter values interactively when prompted
 
 def get_config(name, prompt, default=None, required=True):
@@ -48,10 +50,11 @@ claude_settings = f'''{{
 }}'''
 
 rsa_pub = get_config("CLAUDE_SSH_AUTHORIZED_KEYS", "Enter SSH public key")
+template_name = get_config("CONCH_TEMPLATE_NAME", "Enter Conch Template Name")
 
 def add_config(box):
     # 1. create .claude folder and settings.json
-    result = box.execute(
+    result = box.commands.run(
         "sh",
         args=[
             "-c",
@@ -60,7 +63,7 @@ def add_config(box):
     )
     
     # 2. Configure the SSH authorized_keys file
-    result = box.execute(
+    result = box.commands.run(
         "sh",
         args=[
             "-c",
@@ -68,16 +71,20 @@ def add_config(box):
         ],
     )
 
-def prepare_box():
-    box = Sandbox.create()
+def prepare_box(template_name):
+    box = Sandbox.create(template_name=template_name)
     print(f'sandbox {box.sandbox_id} created')
     ip = box.ip
-    add_config(box)
+    try:
+        add_config(box)
+    except Exception:
+        box.delete()
+        raise
     print(f'sandbox prepared ok with ip={ip}')
     return box, ip
 
 def run_claude_once(box, ip):
-    result = box.execute(
+    result = box.commands.run(
         "claude",
         args=["-p", "What's the day today?",],
         env=env,
@@ -86,18 +93,29 @@ def run_claude_once(box, ip):
     print(f'claude stderr: {result.stderr}')
 
 def run_claude_tui(box, ip):
-    os.system(f'ssh root@{ip}')
+    address = str(ipaddress.IPv4Address(ip))
+    subprocess.run([
+        "ssh",
+        "-t",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        f"root@{address}",
+    ], check=True)
 
 def main():
     if __name__ != '__main__':
         return
+    box = None
     try:
-        box, ip = prepare_box()
+        box, ip = prepare_box(template_name)
+        run_claude_once(box, ip)
+        run_claude_tui(box, ip)
     except Exception as e:
         print(e)
-        return
-    run_claude_once(box, ip)
-    run_claude_tui(box, ip)
-    box.delete()
+    finally:
+        if box:
+            box.delete()
 
 main()

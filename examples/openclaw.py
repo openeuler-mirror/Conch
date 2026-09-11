@@ -4,7 +4,46 @@
 import os
 import json
 import getpass
+import ipaddress
+import posixpath
+import re
+import subprocess
 from conch import Sandbox
+
+SANDBOX_USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+OPENCLAW_REMOTE_COMMAND = (
+    "openclaw gateway --allow-unconfigured > /dev/null 2>&1 & "
+    "sleep 2 && openclaw tui; bash -l"
+)
+
+
+def validate_sandbox_username(username):
+    username = username.strip()
+    if not SANDBOX_USERNAME_RE.fullmatch(username):
+        raise ValueError(f"sandbox returned an invalid account name: {username!r}")
+    return username
+
+
+def validate_sandbox_ipv4(address):
+    try:
+        return str(ipaddress.IPv4Address(address))
+    except ipaddress.AddressValueError as exc:
+        raise ValueError(f"sandbox returned an invalid IPv4 address: {address!r}") from exc
+
+
+def build_openclaw_ssh_command(username, address):
+    username = validate_sandbox_username(username)
+    address = validate_sandbox_ipv4(address)
+    return [
+        "ssh",
+        "-t",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        f"{username}@{address}",
+        OPENCLAW_REMOTE_COMMAND,
+    ]
 
 def get_config(env_name, prompt, default=None, is_secret=False):
     """
@@ -38,26 +77,28 @@ def get_sandbox_home(sandbox):
     Get actual home directory in sandbox.
     Dynamically adapt to different users.
     """
-    whoami_result = sandbox.execute(cmd="whoami")
-    username = whoami_result.stdout.strip()
+    whoami_result = sandbox.commands.run(cmd="whoami")
+    username = validate_sandbox_username(whoami_result.stdout)
     
     if username == 'root':
         return '/root'
     
-    grep_result = sandbox.execute(
-        cmd="sh",
-        args=["-c", f"grep '^{username}:' /etc/passwd"]
-    )
+    grep_result = sandbox.commands.run(cmd="getent", args=["passwd", username])
     
     fields = grep_result.stdout.strip().split(':')
-    return fields[5] if len(fields) >= 6 else '/'
+    if len(fields) < 6:
+        raise ValueError(f"sandbox returned an invalid passwd entry for {username!r}")
+    home = fields[5]
+    if not home.startswith('/') or posixpath.normpath(home) != home:
+        raise ValueError(f"sandbox returned an invalid home directory: {home!r}")
+    return home
 
 def setup_sandbox_configs(sandbox):
     """
     Write required OpenClaw configurations to the sandbox filesystem.
     """
     # Initialize network interface
-    sandbox.execute(cmd="ip", args=["link", "set", "lo", "up"])
+    sandbox.commands.run(cmd="ip", args=["link", "set", "lo", "up"])
 
     # Get sandbox home directory (adapt to different users)
     sandbox_home = get_sandbox_home(sandbox)
@@ -115,30 +156,26 @@ def setup_sandbox_configs(sandbox):
             "filepath": file_path,
             "content": json_str.encode()
         })
-    sandbox.upload(files_to_upload)
+    sandbox.files.upload(files_to_upload)
 
 def main():
-    sandbox = Sandbox.create()
+    template_name = get_config("CONCH_TEMPLATE_NAME", "Enter Conch Template Name")
+    sandbox = Sandbox.create(template_name=template_name)
     print(f"Sandbox created: {sandbox.sandbox_id} (IP: {sandbox.ip})")
 
     try:
         setup_sandbox_configs(sandbox)
 
         # Get sandbox user for SSH connection
-        whoami_result = sandbox.execute(cmd="whoami")
-        sandbox_user = whoami_result.stdout.strip()
+        whoami_result = sandbox.commands.run(cmd="whoami")
+        sandbox_user = validate_sandbox_username(whoami_result.stdout)
 
         print("Configuration complete, ready to start TUI...\n")
 
-        ssh_cmd = (
-            f"ssh -t "
-            f"-o UserKnownHostsFile=/dev/null "
-            f"-o StrictHostKeyChecking=no "
-            f"{sandbox_user}@{sandbox.ip} "
-            f"\"openclaw gateway --allow-unconfigured > /dev/null 2>&1 & sleep 2 && openclaw tui; bash -l\""
+        subprocess.run(
+            build_openclaw_ssh_command(sandbox_user, sandbox.ip),
+            check=True,
         )
-
-        os.system(ssh_cmd)
 
     finally:
         sandbox.delete()

@@ -16,6 +16,7 @@ vendor/
 
 # Go workspace file
 go.work
+.gocache
 
 # IDE
 .idea/
@@ -36,10 +37,11 @@ build/
 # Logs
 *.log
 
-# Protobuf
-api/go_proto/
-api/py_proto/
-
 # python
+.venv/
 __pycache__
 *.pyc
+*.egg-info/
+
+# Local configuration
+config/config.local.yaml

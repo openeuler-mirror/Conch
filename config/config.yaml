@@ -9,32 +9,39 @@ log:
   output: stdout
 
 server:
-  # If unix_socket is set as empty, conchd listens on host:port via TCP. Otherwise, conchd listens on local socket by default
-  unix_socket: /var/run/conchd/conchd.sock
-  pid_file: /var/run/conchd/conchd.pid
   work_dir: /var/run/conch
-  host: 127.0.0.1
-  port: 4063
-
-network:
-  # CIDR capacity: 4093 slots; practical max depends on host/kernel/network setup. Default: 250
-  pool_size: 250
-  # If setting dynamic reservation to true, then there is a background thread keep filling the pool till it reaches the max size set above
-  dynamic_reservation: false
-  # Tap interface address inside the sandbox network namespace
-  tap_ip: 192.168.100.2
-  # CIDR mask for tap_ip
-  tap_mask: 24
-
-containerd:
-  socket: /run/containerd/containerd.sock
-  default_namespace: default
-
-image:
-  # Default multi-arch kernel image used when converting a standard OCI image via `conch pull`
-  default_kernel_image: hub.oepkgs.net/conch/kernel:6.6.0
+  state_dir: /var/lib/conch
 
 sandbox:
+  backend: stratovirt
   vsock_signal_retry: 10ms
   vsock_signal_timeout: 60s
   request_timeout: 60s
+  default_spec:
+    # Default Template selector used when a create request does not specify one.
+    # template_name and template_id are mutually exclusive.
+    template_name: ""
+    # template_id: "sha256:<digest>"
+    vcpu_num: 2
+    vcpu_max: 2
+    ram_mb: 2048
+  stratovirt:
+    binary: /usr/bin/stratovirt
+  cloud_hypervisor:
+    binary: /usr/local/bin/cloud-hypervisor
+
+
+network:
+  # Number of ready-to-use network slots Conch keeps warm. Must not exceed the internal total-slot limit of 4000. Default: 250
+  warm_pool_size: 100
+  cni:
+    # CNI plugin binary search paths used for outer sandbox networking.
+    # These binaries must be installed on the Linux host; libcni does not install them.
+    plugin_bin_dirs:
+      - /usr/libexec/cni
+
+volume:
+  max_mounts: 10
+  backend: virtiofs
+  virtiofs:
+    binary: /usr/libexec/virtiofsd

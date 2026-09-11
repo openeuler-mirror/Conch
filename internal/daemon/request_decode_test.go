@@ -1,0 +1,227 @@
+package daemon
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	containerdclient "github.com/openeuler/Conch/internal/adapters/containerd/client"
+	"github.com/openeuler/Conch/internal/apperror"
+)
+
+func TestDecodeStrictJSON(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		wantErr bool
+	}{
+		{name: "known fields", body: `{"template_name":"` + testTemplateNameExplicit + `","volumeMounts":[{"source":"/tmp/data","path":"/data","readonly":true}]}`},
+		{name: "known Template ID", body: `{"template_id":"` + testTemplateIDExplicit + `"}`},
+		{name: "trailing whitespace", body: "{\"template_name\":\"" + testTemplateNameExplicit + "\"}\n\t"},
+		{name: "unknown top-level field", body: `{"template_name":"` + testTemplateNameExplicit + `","volume_mounts":[]}`, wantErr: true},
+		{name: "unknown nested field", body: `{"template_name":"` + testTemplateNameExplicit + `","volumeMounts":[{"source":"/tmp/data","path":"/data","read_only":true}]}`, wantErr: true},
+		{name: "multiple values", body: `{"template_name":"` + testTemplateNameExplicit + `"}{"sandbox_id":"sandbox-2"}`, wantErr: true},
+		{name: "trailing garbage", body: `{"template_name":"` + testTemplateNameExplicit + `"} trailing`, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var req sandboxCreateRequest
+			err := decodeStrictJSON(strings.NewReader(tt.body), &req)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("decodeStrictJSON() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestDecodeJSONBodyRejectsOversizedRequest(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(strings.Repeat(" ", maxJSONBodyBytes+1)))
+	var out map[string]any
+
+	if decodeJSONBody(recorder, request, &out) {
+		t.Fatal("decodeJSONBody() accepted oversized request")
+	}
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var response apiErrorResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil || response.Code != errRequestBodyTooLarge.Code() {
+		t.Fatalf("body = %q, decoded = %#v, error = %v", recorder.Body.String(), response, err)
+	}
+}
+
+func TestWriteLimitedFileRejectsOversizedInputAndRemovesPartialFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "upload")
+	err := writeLimitedFile(path, strings.NewReader("123456"), 5)
+	if err == nil {
+		t.Fatal("writeLimitedFile() accepted oversized input")
+	}
+	if !errors.Is(err, errRequestBodyTooLarge.New()) {
+		var appErr *apperror.Error
+		if !errors.As(err, &appErr) || appErr.Code() != errRequestBodyTooLarge.Code() {
+			t.Fatalf("writeLimitedFile() error = %v, want %s", err, errRequestBodyTooLarge.Code())
+		}
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatalf("partial file remains: stat error = %v", statErr)
+	}
+}
+
+func TestJSONHandlersRejectUnknownFields(t *testing.T) {
+	snapshotOps := &fakeSnapshotService{}
+	sandboxOps := &fakeSandboxOps{}
+	runtimeService := newHandlerRuntime(sandboxOps, nil, nil)
+	runtimeService.Snapshot = snapshotOps
+	server := &Daemon{
+		router:         http.NewServeMux(),
+		runtimeService: runtimeService,
+		daemonClient:   &containerdclient.Client{},
+	}
+	server.routes()
+
+	paths := []string{
+		"/api/v1/sandboxes",
+		"/api/sandbox/suspend",
+		"/api/sandbox/resume",
+		"/api/sandbox/checkpoint",
+		"/api/template/pull",
+		"/api/template/push",
+		"/api/template/unpack",
+		"/api/template/list",
+		"/api/template/inspect",
+		"/api/template/remove",
+		"/api/image/pull",
+		"/api/image/push",
+		"/api/image/list",
+		"/api/image/remove",
+		"/api/snapshot/info",
+		"/api/snapshot/list",
+		"/api/snapshot/remove",
+	}
+
+	for _, path := range paths {
+		t.Run(path, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"unexpected":true}`))
+			server.router.ServeHTTP(recorder, request)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			var response apiErrorResponse
+			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil || response.Code != "request.invalid_body" || !strings.Contains(response.Error, `unknown field "unexpected"`) {
+				t.Fatalf("body = %q, decoded = %#v, error = %v", recorder.Body.String(), response, err)
+			}
+		})
+	}
+
+	if sandboxOps.createReq.SandboxID != "" || sandboxOps.suspendReq != "" ||
+		sandboxOps.resumeReq != "" || sandboxOps.checkpointReq != "" {
+		t.Fatalf("sandbox backend was called: %#v", sandboxOps)
+	}
+	if snapshotOps.infoReq.Key != "" || snapshotOps.removeReq.Key != "" {
+		t.Fatalf("snapshot backend was called: %#v", snapshotOps)
+	}
+}
+
+func TestTemplateCreateRejectsUnknownMetadataField(t *testing.T) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if err := writer.WriteField("metadata", `{"source":"example.invalid/image:latest","unexpected":true}`); err != nil {
+		t.Fatalf("write metadata: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart body: %v", err)
+	}
+
+	server := &Daemon{router: http.NewServeMux(), runtimeService: newHandlerRuntime(nil, nil, nil)}
+	server.routes()
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/template/create", &body)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	server.router.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var response apiErrorResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil || response.Code != "request.invalid_multipart" || !strings.Contains(response.Error, `unknown field "unexpected"`) {
+		t.Fatalf("body = %q, decoded = %#v, error = %v", recorder.Body.String(), response, err)
+	}
+}
+
+func TestTemplateCreateAcceptsAllMetadataFields(t *testing.T) {
+	metadata := `{
+		"source":"example.invalid/image:latest",
+		"plain_http":true,
+		"username":"tester",
+		"password":"secret",
+		"labels":{"purpose":"strict-json-test"}
+	}`
+
+	var req templateCreateRequest
+	if err := decodeStrictJSON(strings.NewReader(metadata), &req); err != nil {
+		t.Fatalf("decode metadata: %v", err)
+	}
+	if req.Source != "example.invalid/image:latest" || !req.PlainHTTP ||
+		req.Username != "tester" || req.Password != "secret" ||
+		req.Labels["purpose"] != "strict-json-test" {
+		t.Fatalf("decoded metadata = %#v", req)
+	}
+}
+
+func TestSandboxCreateRejectsUnknownFieldsWithoutSideEffects(t *testing.T) {
+	tests := []struct {
+		name         string
+		body         string
+		unknownField string
+	}{
+		{
+			name:         "top-level field",
+			body:         `{"template_name":"` + testTemplateNameExplicit + `","sandbox_id":"must-not-exist","volume_mounts":[]}`,
+			unknownField: "volume_mounts",
+		},
+		{
+			name:         "nested field",
+			body:         `{"template_name":"` + testTemplateNameExplicit + `","sandbox_id":"must-not-exist","volumeMounts":[{"source":"/tmp/data","path":"/data","read_only":true}]}`,
+			unknownField: "read_only",
+		},
+		{
+			name:         "removed lease ID",
+			body:         `{"template_name":"` + testTemplateNameExplicit + `","sandbox_id":"must-not-exist","lease_id":"legacy-lease"}`,
+			unknownField: "lease_id",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sandboxOps := &fakeSandboxOps{}
+			runtimeService := newHandlerRuntime(sandboxOps, nil, nil)
+			server := &Daemon{router: http.NewServeMux(), runtimeService: runtimeService}
+			server.routes()
+
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, "/api/v1/sandboxes", strings.NewReader(tt.body))
+			server.router.ServeHTTP(recorder, request)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			if !strings.Contains(recorder.Body.String(), tt.unknownField) {
+				t.Fatalf("body = %q, want unknown field %q", recorder.Body.String(), tt.unknownField)
+			}
+			if sandboxOps.createReq.SandboxID != "" {
+				t.Fatalf("sandbox create was called: %#v", sandboxOps.createReq)
+			}
+		})
+	}
+}

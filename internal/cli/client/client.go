@@ -1,0 +1,161 @@
+package client
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	conchconfig "github.com/openeuler/Conch/internal/config"
+)
+
+const (
+	defaultUnixAPIURL  = "http://conchd-unix"
+	defaultHTTPTimeout = 120 * time.Second
+)
+
+// Options controls conchd API endpoint discovery and request timeout.
+type Options struct {
+	BaseURL    string
+	ConfigPath string
+	Timeout    time.Duration
+}
+
+// Client communicates with the conchd HTTP API.
+type Client struct {
+	baseURL    string
+	httpClient *http.Client
+}
+
+// APIError is returned for a non-success conchd response. Code is stable for
+// automation; Message is intended for people and may change between releases.
+type APIError struct {
+	Path       string
+	StatusCode int
+	Code       string
+	Message    string
+}
+
+func (e *APIError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	if e.Code != "" && e.Message != "" {
+		return fmt.Sprintf("%s returned status %d (%s): %s", e.Path, e.StatusCode, e.Code, e.Message)
+	}
+	if e.Message != "" {
+		return fmt.Sprintf("%s returned status %d: %s", e.Path, e.StatusCode, e.Message)
+	}
+	return fmt.Sprintf("%s returned status %d", e.Path, e.StatusCode)
+}
+
+// New creates a conchd API client.
+func New(opts Options) (*Client, error) {
+	baseURL, httpClient, err := resolveTransport(opts)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{baseURL: baseURL, httpClient: httpClient}, nil
+}
+
+func resolveTransport(opts Options) (string, *http.Client, error) {
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = resolveHTTPTimeout()
+	}
+	configPath := opts.ConfigPath
+	if configPath == "" {
+		configPath = conchconfig.FindConfigFile()
+	}
+	cfg, err := conchconfig.LoadConfig(configPath)
+	if err != nil {
+		return "", nil, fmt.Errorf("load conch client config: %w", err)
+	}
+	if baseURL := normalizeBaseURL(opts.BaseURL); baseURL != "" {
+		return baseURL, &http.Client{Timeout: timeout}, nil
+	}
+	if baseURL := normalizeBaseURL(os.Getenv("CONCH_API_URL")); baseURL != "" {
+		return baseURL, &http.Client{Timeout: timeout}, nil
+	}
+	unixSocket := strings.TrimSpace(cfg.GetServerUnixSocket())
+	if unixSocket == "" {
+		return "", nil, fmt.Errorf("conchd unix socket is not configured in %s", configPath)
+	}
+	return defaultUnixAPIURL, newUnixSocketHTTPClient(unixSocket, timeout), nil
+}
+
+func normalizeBaseURL(value string) string {
+	return strings.TrimRight(strings.TrimSpace(value), "/")
+}
+
+func resolveHTTPTimeout() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("CONCH_API_TIMEOUT"))
+	if raw == "" {
+		return defaultHTTPTimeout
+	}
+	timeout, err := time.ParseDuration(raw)
+	if err != nil || timeout <= 0 {
+		return defaultHTTPTimeout
+	}
+	return timeout
+}
+
+func newUnixSocketHTTPClient(socketPath string, timeout time.Duration) *http.Client {
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var dialer net.Dialer
+			return dialer.DialContext(ctx, "unix", socketPath)
+		},
+	}
+	return &http.Client{Timeout: timeout, Transport: transport}
+}
+
+func (c *Client) postJSON(ctx context.Context, path string, payload, out any) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create request %s: %w", path, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("POST %s: %w", path, err)
+	}
+	defer resp.Body.Close()
+	return decodeResponse(resp, path, out)
+}
+
+func decodeResponse(resp *http.Response, path string, out any) error {
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		apiErr := &APIError{Path: path, StatusCode: resp.StatusCode}
+		var structured struct {
+			Code  string `json:"code"`
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(body, &structured) == nil && structured.Error != "" {
+			apiErr.Code = structured.Code
+			apiErr.Message = structured.Error
+		} else {
+			apiErr.Message = strings.TrimSpace(string(body))
+		}
+		return apiErr
+	}
+	if out == nil || resp.StatusCode == http.StatusNoContent {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("decode %s response: %w", path, err)
+	}
+	return nil
+}
