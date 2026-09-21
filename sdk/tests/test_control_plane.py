@@ -1,3 +1,5 @@
+from unittest.mock import Mock
+
 import pytest
 import requests
 
@@ -31,6 +33,7 @@ class FakeSession:
             return FakeResponse(data=[{"sandboxID": "sandbox-1"}])
         return FakeResponse(data={
             "sandboxID": "sandbox-1",
+            "templateName": "registry.example/conch/test:latest",
             "templateID": "template-1",
             "domain": "192.0.2.10",
             "metadata": {"owner": "test"},
@@ -53,6 +56,7 @@ def test_control_plane_methods_use_configured_endpoint(monkeypatch):
     assert Sandbox.list() == [{"sandboxID": "sandbox-1"}]
 
     sandbox = Sandbox.get("sandbox-1")
+    assert sandbox.template_name == "registry.example/conch/test:latest"
     assert sandbox.template_id == "template-1"
     assert sandbox.metadata == {"owner": "test"}
     assert sandbox.control_plane_only is True
@@ -79,6 +83,61 @@ def test_control_plane_transport_failures(monkeypatch):
         Sandbox.list()
 
 
+@pytest.mark.parametrize("close_error", [None, RuntimeError("close failed")])
+def test_delete_clears_local_sandbox_state(monkeypatch, close_error):
+    monkeypatch.setattr(sandbox_module.requests_unixsocket, "Session", FakeSession)
+    sandbox = Sandbox.get("sandbox-1")
+    client = Mock()
+    client.close.side_effect = close_error
+    sandbox.client = client
+    cached_fields = (
+        "ip", "agent_token", "template_name", "template_id", "vcpu_num",
+        "vcpu_max", "ram_mb", "vmm_name", "image_name", "snapshot_id",
+        "started_at", "end_at", "disk_size_mb", "conch_init_version", "alias",
+    )
+    for field in cached_fields:
+        setattr(sandbox, field, "cached")
+    sandbox.volume_mounts = [{"path": "/data"}]
+    sandbox.env = {"KEY": "value"}
+    sandbox.lifecycle = {"state": "running"}
+
+    assert sandbox.delete() is True
+
+    assert sandbox.get_info() == sandbox_module.SandboxInfo("", "", None, None)
+    assert all(getattr(sandbox, field) is None for field in cached_fields)
+    assert sandbox.metadata == {}
+    assert sandbox.lifecycle == {}
+    assert sandbox.volume_mounts == []
+    assert sandbox.env is None
+    assert sandbox.network is None
+    assert sandbox._client is None
+    client.close.assert_called_once_with()
+    with pytest.raises(RuntimeError, match="not initialized"):
+        sandbox.health_check()
+
+
+@pytest.mark.parametrize("delete_fails", [False, True])
+def test_delete_preserves_state_on_failure_or_other_target(monkeypatch, delete_fails):
+    monkeypatch.setattr(sandbox_module.requests_unixsocket, "Session", FakeSession)
+    sandbox = Sandbox.get("sandbox-1")
+    client = Mock()
+    sandbox.client = client
+    before = vars(sandbox).copy()
+    delete = Mock(side_effect=requests.HTTPError("delete failed") if delete_fails else None)
+    monkeypatch.setattr(sandbox._session, "delete", delete)
+
+    if delete_fails:
+        with pytest.raises(RuntimeError, match="delete failed"):
+            sandbox.delete()
+    else:
+        delete.return_value = FakeResponse(204)
+        assert sandbox.delete("sandbox-2") is True
+        assert delete.call_args.args[0].endswith("/sandboxes/sandbox-2")
+
+    assert vars(sandbox) == before
+    client.close.assert_not_called()
+
+
 def test_control_plane_structured_error_uses_code_and_message():
     response = requests.Response()
     response.status_code = 400
@@ -100,6 +159,29 @@ def test_control_plane_plain_text_error_fallback():
     error = requests.HTTPError(response=response)
 
     assert sandbox_module._request_exception_message(error) == "legacy server failure"
+
+
+def test_checkpoint_uses_requested_name_when_response_only_contains_id(monkeypatch):
+    class CheckpointSession:
+        def __init__(self):
+            self.payload = None
+
+        def post(self, url, json=None):
+            self.payload = json
+            return FakeResponse(data={"status": "ok", "template_id": "sha256:checkpoint"})
+
+    session = CheckpointSession()
+    monkeypatch.setattr(sandbox_module.requests_unixsocket, "Session", lambda: session)
+    sandbox = Sandbox(sandbox_id="sandbox-1")
+
+    result = sandbox.checkpoint("  registry.example/conch/checkpoint:latest  ")
+
+    assert result.template_name == "registry.example/conch/checkpoint:latest"
+    assert result.template_id == "sha256:checkpoint"
+    assert session.payload == {
+        "sandbox_id": "sandbox-1",
+        "template_name": "registry.example/conch/checkpoint:latest",
+    }
 
 
 def test_network_config_is_hydrated_and_updated(monkeypatch):

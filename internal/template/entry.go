@@ -21,10 +21,10 @@ const (
 	BootModeResume BootMode = "resume"
 )
 
-// Entry is the non-persistent domain representation of a fully published and
-// validated Template. An Entry has no lifecycle state: if it exists, it is
-// ready to be consumed.
+// Entry is the metadata of a named Template. Name maps to one image record;
+// BootIndexDigest identifies its immutable content.
 type Entry struct {
+	Name                  string
 	Origin                Origin
 	BootMode              BootMode
 	BootIndexDigest       string
@@ -38,6 +38,10 @@ type Entry struct {
 // NormalizeEntry validates a complete Template and returns a defensive,
 // canonical copy suitable for persistence.
 func NormalizeEntry(entry Entry) (Entry, error) {
+	entry.Name = strings.TrimSpace(entry.Name)
+	if entry.Name == "" {
+		return Entry{}, ErrInvalidArtifact.Wrap(fmt.Errorf("template name is required"))
+	}
 	switch entry.Origin {
 	case OriginImage, OriginCheckpoint:
 	default:

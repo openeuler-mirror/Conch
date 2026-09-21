@@ -19,13 +19,14 @@ type PublishBootIndexOptions struct {
 }
 
 type PublishBootIndexResult struct {
-	BootIndexDigest string `json:"boot_index_digest"`
-	BuildRef        string `json:"build_ref"`
+	BootIndexDigest string             `json:"boot_index_digest"`
+	Target          ocispec.Descriptor `json:"-"`
 }
 
-type PullBootIndexResult struct {
-	Info     BootIndexInfo
-	BuildRef string
+type PulledBootIndex struct {
+	Info            BootIndexInfo
+	SourceImageName string
+	Target          ocispec.Descriptor `json:"-"`
 }
 
 // BootIndexInfo is the validated, content-addressed view of a Conch Boot
@@ -39,6 +40,7 @@ type BootIndexInfo struct {
 	Resume            bool               `json:"resume"`
 	VMMName           string             `json:"vmm_name,omitempty"`
 	MemorySizeMB      int64              `json:"memory_size_mb,omitempty"`
+	CPUCount          int64              `json:"cpu_count,omitempty"`
 }
 
 // PublishCheckpointBootIndexOptions publishes captured memory and VMM state as
@@ -50,13 +52,14 @@ type PublishCheckpointBootIndexOptions struct {
 	MemRoot               string `json:"mem_root"`
 	VMMName               string `json:"vmm_name"`
 	MemorySizeMB          int64  `json:"memory_size_mb"`
+	CPUCount              int64  `json:"cpu_count"`
 }
 
 // PublishCheckpointBootIndexResult deliberately contains no snapshot keys:
 // publishing checkpoint content must not create checkpoint snapshots.
 type PublishCheckpointBootIndexResult struct {
-	BootIndexDigest string `json:"boot_index_digest"`
-	BuildRef        string `json:"build_ref"`
+	BootIndexDigest string             `json:"boot_index_digest"`
+	Target          ocispec.Descriptor `json:"-"`
 }
 
 // PushBootIndexOptions publishes the descriptor closure rooted at an

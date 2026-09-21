@@ -2,26 +2,137 @@ package sandbox
 
 import (
 	"context"
-	"fmt"
+	"errors"
+	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/opencontainers/go-digest"
 
 	conchimage "github.com/openeuler/Conch/internal/image"
 	"github.com/openeuler/Conch/internal/snapshot"
-	"github.com/openeuler/Conch/internal/template"
 )
+
+func TestBootPreparerReturnsSnapshotRefsFromBackend(t *testing.T) {
+	bootDigest := digest.FromString(t.Name()).String()
+	want := []snapshot.RuntimeSnapshotRef{
+		{Snapshotter: "erofs", Role: "rootfs", Key: "sandbox-a"},
+		{Snapshotter: "erofs", Role: "vm", Key: "view-vm-sandbox-a"},
+	}
+	snapshots := &fakeSnapshotBackend{runtimeRefs: want}
+	got, err := mustBootPreparer(t, snapshots, &fakeBootResolver{
+		result: resolvedBoot(bootDigest, false, ""),
+	}).Prepare(context.Background(), PrepareBootRequest{
+		TemplateID: bootDigest,
+		SandboxID:  "sandbox-a",
+		VMMName:    "stratovirt",
+		RAMMB:      512,
+	})
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if !reflect.DeepEqual(got.RuntimeSnapshots, want) {
+		t.Fatalf("runtime snapshot refs = %#v, want %#v", got.RuntimeSnapshots, want)
+	}
+}
+
+type observedDoneContext struct {
+	context.Context
+	observed chan<- struct{}
+}
+
+func (c observedDoneContext) Done() <-chan struct{} {
+	select {
+	case c.observed <- struct{}{}:
+	default:
+	}
+	return c.Context.Done()
+}
+
+func TestBootPreparerCallerCancellationDoesNotCancelSharedResolution(t *testing.T) {
+	bootDigest := digest.FromString(t.Name()).String()
+	resolverContext := make(chan context.Context, 1)
+	release := make(chan struct{})
+	var calls atomic.Int32
+	preparer := &bootPreparer{
+		resolveContext: context.Background(),
+		resolveTimeout: time.Second,
+		resolveBoot: func(ctx context.Context, gotDigest string) (conchimage.ResolvedBoot, error) {
+			calls.Add(1)
+			select {
+			case resolverContext <- ctx:
+			default:
+			}
+			<-release
+			return resolvedBoot(gotDigest, false, ""), nil
+		},
+	}
+
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := preparer.resolveTemplate(requestCtx, bootDigest)
+		done <- err
+	}()
+	sharedCtx := <-resolverContext
+	cancelRequest()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("resolveTemplate() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("canceled caller remained blocked by shared boot resolution")
+	}
+	if err := sharedCtx.Err(); err != nil {
+		t.Fatalf("request cancellation propagated to shared resolver: %v", err)
+	}
+
+	followerWaiting := make(chan struct{}, 1)
+	followerDone := make(chan error, 1)
+	go func() {
+		ctx := observedDoneContext{Context: context.Background(), observed: followerWaiting}
+		_, err := preparer.resolveTemplate(ctx, bootDigest)
+		followerDone <- err
+	}()
+	<-followerWaiting
+	close(release)
+	if err := <-followerDone; err != nil {
+		t.Fatalf("follower resolveTemplate() error = %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("ResolveBoot() calls = %d, want 1", got)
+	}
+}
+
+func TestBootPreparerContainsResolverPanic(t *testing.T) {
+	bootDigest := digest.FromString(t.Name()).String()
+	preparer := &bootPreparer{
+		resolveContext: context.Background(),
+		resolveTimeout: time.Second,
+		resolveBoot: func(context.Context, string) (conchimage.ResolvedBoot, error) {
+			panic("resolver failure")
+		},
+	}
+
+	_, err := preparer.resolveTemplate(context.Background(), bootDigest)
+	if err == nil || !strings.Contains(err.Error(), "boot resolver panicked") {
+		t.Fatalf("resolveTemplate() error = %v, want contained panic", err)
+	}
+}
 
 func TestBootPreparerColdCreateResolvesBootIndexWithoutSnapshotInfo(t *testing.T) {
 	ctx := context.Background()
-	templates, entry, bootDigest := newBootTemplate(t, template.OriginImage, template.BootModeCold)
+	bootDigest := digest.FromString(t.Name()).String()
 	resolver := &fakeBootResolver{result: resolvedBoot(bootDigest, false, "")}
 	snapshots := &fakeSnapshotBackend{}
-	preparer := mustBootPreparer(t, templates, snapshots, resolver)
+	preparer := mustBootPreparer(t, snapshots, resolver)
 
 	got, err := preparer.Prepare(ctx, PrepareBootRequest{
-		TemplateID: entry.BootIndexDigest,
+		TemplateID: bootDigest,
 		SandboxID:  "sandbox-a",
 		VMMName:    "cloud-hypervisor",
 		RAMMB:      512,
@@ -43,11 +154,8 @@ func TestBootPreparerColdCreateResolvesBootIndexWithoutSnapshotInfo(t *testing.T
 	if call.parents != (snapshot.ParentSnapshotIDs{Rootfs: "rootfs-committed", VM: "vm-committed"}) {
 		t.Fatalf("cold parents = %#v", call.parents)
 	}
-	if got.Runtime.Resume || got.Runtime.BootIndexDigest != bootDigest || got.Runtime.CapturedVMMName != "" {
-		t.Fatalf("cold runtime = %#v", got.Runtime)
-	}
-	if got.Runtime.RootfsKey != "sandbox-a" || got.Runtime.MemKey != "sandbox-a-mem" {
-		t.Fatalf("runtime handles = %#v", got.Runtime)
+	if got.Resume {
+		t.Fatal("cold boot marked as resume")
 	}
 	if got.Spec.MemorySizeMB != 512 || !strings.Contains(got.Spec.MemoryPath, "sandbox-a") {
 		t.Fatalf("cold boot spec = %#v", got.Spec)
@@ -56,12 +164,12 @@ func TestBootPreparerColdCreateResolvesBootIndexWithoutSnapshotInfo(t *testing.T
 
 func TestBootPreparerStratovirtColdCreateUsesNoMemoryLayer(t *testing.T) {
 	ctx := context.Background()
-	templates, entry, bootDigest := newBootTemplate(t, template.OriginImage, template.BootModeCold)
+	bootDigest := digest.FromString(t.Name()).String()
 	resolver := &fakeBootResolver{result: resolvedBoot(bootDigest, false, "")}
 	snapshots := &fakeSnapshotBackend{}
 
-	got, err := mustBootPreparer(t, templates, snapshots, resolver).Prepare(ctx, PrepareBootRequest{
-		TemplateID: entry.BootIndexDigest,
+	got, err := mustBootPreparer(t, snapshots, resolver).Prepare(ctx, PrepareBootRequest{
+		TemplateID: bootDigest,
 		SandboxID:  "sandbox-stratovirt",
 		VMMName:    "stratovirt",
 		RAMMB:      768,
@@ -78,20 +186,18 @@ func TestBootPreparerStratovirtColdCreateUsesNoMemoryLayer(t *testing.T) {
 	if got.Spec.MemoryPath != "" || got.Spec.SnapfilePath != "" {
 		t.Fatalf("StratoVirt cold spec = %#v", got.Spec)
 	}
-	if got.Runtime.MemKey != "" || got.Runtime.MemMount != "" {
-		t.Fatalf("StratoVirt cold runtime = %#v", got.Runtime)
-	}
+
 }
 
 func TestBootPreparerResumeRestoresResolvedBootIndex(t *testing.T) {
 	ctx := context.Background()
-	templates, entry, bootDigest := newBootTemplate(t, template.OriginCheckpoint, template.BootModeResume)
+	bootDigest := digest.FromString(t.Name()).String()
 	resolver := &fakeBootResolver{result: resolvedBoot(bootDigest, true, "cloud-hypervisor")}
 	snapshots := &fakeSnapshotBackend{}
-	preparer := mustBootPreparer(t, templates, snapshots, resolver)
+	preparer := mustBootPreparer(t, snapshots, resolver)
 
 	got, err := preparer.Prepare(ctx, PrepareBootRequest{
-		TemplateID: entry.BootIndexDigest,
+		TemplateID: bootDigest,
 		SandboxID:  "sandbox-a",
 		VMMName:    "cloud-hypervisor",
 	})
@@ -112,8 +218,8 @@ func TestBootPreparerResumeRestoresResolvedBootIndex(t *testing.T) {
 	if call.parents != (snapshot.ParentSnapshotIDs{Rootfs: "rootfs-committed", Mem: "mem-committed", VM: "vm-committed"}) {
 		t.Fatalf("resume parents = %#v", call.parents)
 	}
-	if !got.Runtime.Resume || got.Runtime.BootIndexDigest != bootDigest || got.Runtime.CapturedVMMName != "cloud-hypervisor" {
-		t.Fatalf("resume runtime = %#v", got.Runtime)
+	if !got.Resume {
+		t.Fatal("checkpoint boot is not marked as resume")
 	}
 	if got.Spec.SnapfilePath == "" {
 		t.Fatalf("resume boot = %#v", got)
@@ -121,19 +227,13 @@ func TestBootPreparerResumeRestoresResolvedBootIndex(t *testing.T) {
 }
 
 func TestBootPreparerRejectsMissingBootIndexDigest(t *testing.T) {
-	entry := template.Entry{
-		Origin:   template.OriginImage,
-		BootMode: template.BootModeCold,
-	}
-	templates := &fakeTemplateReader{entry: entry}
 	resolver := &fakeBootResolver{}
 	snapshots := &fakeSnapshotBackend{}
 
-	_, err := mustBootPreparer(t, templates, snapshots, resolver).Prepare(context.Background(), PrepareBootRequest{
-		TemplateID: digest.FromString("missing").String(),
-		SandboxID:  "sandbox-a",
+	_, err := mustBootPreparer(t, snapshots, resolver).Prepare(context.Background(), PrepareBootRequest{
+		SandboxID: "sandbox-a",
 	})
-	if err == nil || !strings.Contains(err.Error(), "has no boot index digest") {
+	if err == nil || !strings.Contains(err.Error(), "template_id is required") {
 		t.Fatalf("Prepare() error = %v, want missing digest error", err)
 	}
 	if len(resolver.requests) != 0 || snapshots.callCount() != 0 {
@@ -141,45 +241,13 @@ func TestBootPreparerRejectsMissingBootIndexDigest(t *testing.T) {
 	}
 }
 
-func TestBootPreparerRejectsCachedCapabilityMismatch(t *testing.T) {
-	for _, tt := range []struct {
-		name         string
-		cachedMode   template.BootMode
-		resolvedMode template.BootMode
-	}{
-		{name: "cached cold resolved resume", cachedMode: template.BootModeCold, resolvedMode: template.BootModeResume},
-		{name: "cached resume resolved cold", cachedMode: template.BootModeResume, resolvedMode: template.BootModeCold},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			templates, entry, bootDigest := newBootTemplate(t, template.OriginImage, tt.cachedMode)
-			resume := tt.resolvedMode == template.BootModeResume
-			vmmName := ""
-			if resume {
-				vmmName = "cloud-hypervisor"
-			}
-			resolver := &fakeBootResolver{result: resolvedBoot(bootDigest, resume, vmmName)}
-			snapshots := &fakeSnapshotBackend{}
-			_, err := mustBootPreparer(t, templates, snapshots, resolver).Prepare(context.Background(), PrepareBootRequest{
-				TemplateID: entry.BootIndexDigest,
-				SandboxID:  "sandbox-a",
-			})
-			if err == nil || !strings.Contains(err.Error(), "cached boot mode") {
-				t.Fatalf("Prepare() error = %v, want capability mismatch", err)
-			}
-			if snapshots.callCount() != 0 {
-				t.Fatalf("snapshot backend called for mismatched capability: %#v", snapshots)
-			}
-		})
-	}
-}
-
 func TestBootPreparerRejectsResumeVMMMismatch(t *testing.T) {
-	templates, entry, bootDigest := newBootTemplate(t, template.OriginCheckpoint, template.BootModeResume)
+	bootDigest := digest.FromString(t.Name()).String()
 	resolver := &fakeBootResolver{result: resolvedBoot(bootDigest, true, "cloud-hypervisor")}
 	snapshots := &fakeSnapshotBackend{}
 
-	_, err := mustBootPreparer(t, templates, snapshots, resolver).Prepare(context.Background(), PrepareBootRequest{
-		TemplateID: entry.BootIndexDigest,
+	_, err := mustBootPreparer(t, snapshots, resolver).Prepare(context.Background(), PrepareBootRequest{
+		TemplateID: bootDigest,
 		SandboxID:  "sandbox-a",
 		VMMName:    "stratovirt",
 	})
@@ -192,13 +260,13 @@ func TestBootPreparerRejectsResumeVMMMismatch(t *testing.T) {
 }
 
 func TestBootPreparerRejectsStratovirtResumeWithoutMemorySize(t *testing.T) {
-	templates, entry, bootDigest := newBootTemplate(t, template.OriginCheckpoint, template.BootModeResume)
+	bootDigest := digest.FromString(t.Name()).String()
 	resolved := resolvedBoot(bootDigest, true, "stratovirt")
 	resolved.MemorySizeMB = 0
 	snapshots := &fakeSnapshotBackend{}
 
-	_, err := mustBootPreparer(t, templates, snapshots, &fakeBootResolver{result: resolved}).Prepare(context.Background(), PrepareBootRequest{
-		TemplateID: entry.BootIndexDigest,
+	_, err := mustBootPreparer(t, snapshots, &fakeBootResolver{result: resolved}).Prepare(context.Background(), PrepareBootRequest{
+		TemplateID: bootDigest,
 		SandboxID:  "sandbox-a",
 		VMMName:    "stratovirt",
 	})
@@ -212,31 +280,26 @@ func TestBootPreparerRejectsStratovirtResumeWithoutMemorySize(t *testing.T) {
 
 func TestBootPreparerCreatesDistinctRuntimeHandlesFromSharedCommittedParents(t *testing.T) {
 	ctx := context.Background()
-	templates, entry, bootDigest := newBootTemplate(t, template.OriginCheckpoint, template.BootModeResume)
+	bootDigest := digest.FromString(t.Name()).String()
 	resolver := &fakeBootResolver{result: resolvedBoot(bootDigest, true, "stratovirt")}
 	snapshots := &fakeSnapshotBackend{}
-	preparer := mustBootPreparer(t, templates, snapshots, resolver)
+	preparer := mustBootPreparer(t, snapshots, resolver)
 
 	first, err := preparer.Prepare(ctx, PrepareBootRequest{
-		TemplateID: entry.BootIndexDigest, SandboxID: "sandbox-a", VMMName: "stratovirt",
+		TemplateID: bootDigest, SandboxID: "sandbox-a", VMMName: "stratovirt",
 	})
 	if err != nil {
 		t.Fatalf("first Prepare() error = %v", err)
 	}
 	second, err := preparer.Prepare(ctx, PrepareBootRequest{
-		TemplateID: entry.BootIndexDigest, SandboxID: "sandbox-b", VMMName: "stratovirt",
+		TemplateID: bootDigest, SandboxID: "sandbox-b", VMMName: "stratovirt",
 	})
 	if err != nil {
 		t.Fatalf("second Prepare() error = %v", err)
 	}
 
-	if first.Runtime.RootfsKey == second.Runtime.RootfsKey || first.Runtime.MemKey == second.Runtime.MemKey {
-		t.Fatalf("runtime handles are shared: first=%#v second=%#v", first.Runtime, second.Runtime)
-	}
-	if first.Runtime.RootfsMount == second.Runtime.RootfsMount ||
-		first.Runtime.MemMount == second.Runtime.MemMount ||
-		first.Runtime.VMMount == second.Runtime.VMMount {
-		t.Fatalf("runtime mounts are shared: first=%#v second=%#v", first.Runtime, second.Runtime)
+	if first.Spec.KernelPath == second.Spec.KernelPath || first.Spec.SnapfilePath == second.Spec.SnapfilePath {
+		t.Fatalf("instances share boot paths: first=%#v second=%#v", first.Spec, second.Spec)
 	}
 	if len(snapshots.restores) != 2 || snapshots.restores[0].parents != snapshots.restores[1].parents {
 		t.Fatalf("restore parents = %#v", snapshots.restores)
@@ -253,21 +316,6 @@ func TestBootPreparerCreatesDistinctRuntimeHandlesFromSharedCommittedParents(t *
 	if len(resolver.requests) != 2 {
 		t.Fatalf("Boot resolver count = %d, want 2", len(resolver.requests))
 	}
-}
-
-type fakeTemplateReader struct {
-	entry template.Entry
-	err   error
-}
-
-func (f *fakeTemplateReader) Get(_ context.Context, bootIndexDigest string) (template.Entry, error) {
-	if f.err != nil {
-		return template.Entry{}, f.err
-	}
-	if f.entry.BootIndexDigest != "" && f.entry.BootIndexDigest != bootIndexDigest {
-		return template.Entry{}, fmt.Errorf("template %s not found", bootIndexDigest)
-	}
-	return f.entry, nil
 }
 
 type bootResolverCall struct {
@@ -299,9 +347,10 @@ type bootLayoutCall struct {
 // successful prepare tests prove boot identity is resolved from immutable
 // Template and Boot Index data only.
 type fakeSnapshotBackend struct {
-	creates  []bootLayoutCall
-	restores []bootLayoutCall
-	releases []bootLayoutCall
+	creates     []bootLayoutCall
+	restores    []bootLayoutCall
+	releases    []bootLayoutCall
+	runtimeRefs []snapshot.RuntimeSnapshotRef
 }
 
 func (f *fakeSnapshotBackend) CreateBootLayout(_ context.Context, key string, req snapshot.BootLayoutRequest) (*snapshot.BootLayout, error) {
@@ -311,7 +360,9 @@ func (f *fakeSnapshotBackend) CreateBootLayout(_ context.Context, key string, re
 		memoryLayout: req.MemoryLayout,
 		memorySizeMB: req.MemorySizeMB,
 	})
-	return fakeBootLayout(key, req.MemorySizeMB, req.MemoryLayout), nil
+	layout := fakeBootLayout(key, req.MemorySizeMB, req.MemoryLayout)
+	layout.RuntimeSnapshots = append([]snapshot.RuntimeSnapshotRef(nil), f.runtimeRefs...)
+	return layout, nil
 }
 
 func (f *fakeSnapshotBackend) RestoreBootLayout(_ context.Context, key string, req snapshot.BootLayoutRequest) (*snapshot.BootLayout, error) {
@@ -321,7 +372,9 @@ func (f *fakeSnapshotBackend) RestoreBootLayout(_ context.Context, key string, r
 		memoryLayout: req.MemoryLayout,
 		memorySizeMB: req.MemorySizeMB,
 	})
-	return fakeBootLayout(key, req.MemorySizeMB, req.MemoryLayout), nil
+	layout := fakeBootLayout(key, req.MemorySizeMB, req.MemoryLayout)
+	layout.RuntimeSnapshots = append([]snapshot.RuntimeSnapshotRef(nil), f.runtimeRefs...)
+	return layout, nil
 }
 
 func (f *fakeSnapshotBackend) ReleaseBootLayout(_ context.Context, key string) error {
@@ -348,20 +401,9 @@ func resolvedBoot(bootDigest string, resume bool, vmmName string) conchimage.Res
 	return result
 }
 
-func newBootTemplate(t *testing.T, origin template.Origin, mode template.BootMode) (*fakeTemplateReader, template.Entry, string) {
+func mustBootPreparer(t *testing.T, snapshots SnapshotBackend, resolver *fakeBootResolver) BootPreparer {
 	t.Helper()
-	bootDigest := digest.FromString(t.Name() + "/" + string(origin) + "/" + string(mode)).String()
-	entry := template.Entry{
-		Origin:          origin,
-		BootMode:        mode,
-		BootIndexDigest: bootDigest,
-	}
-	return &fakeTemplateReader{entry: entry}, entry, bootDigest
-}
-
-func mustBootPreparer(t *testing.T, templates TemplateReader, snapshots SnapshotBackend, resolver *fakeBootResolver) BootPreparer {
-	t.Helper()
-	preparer, err := newBootPreparer(templates, snapshots, resolver.ResolveBoot)
+	preparer, err := newBootPreparer(context.Background(), snapshots, time.Minute, resolver.ResolveBoot)
 	if err != nil {
 		t.Fatalf("NewBootPreparer() error = %v", err)
 	}

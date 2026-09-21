@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/leases"
 	continuityfs "github.com/containerd/continuity/fs"
 	"github.com/containerd/errdefs"
 	"github.com/opencontainers/go-digest"
@@ -29,7 +31,34 @@ import (
 const (
 	AnnotationVMM          = "io.conch.vmm"
 	AnnotationMemorySizeMB = "io.conch.memory-size-mb"
+	AnnotationCPUCount     = "io.conch.cpu-count"
 )
+
+func withBootIndexLease(ctx context.Context, client *containerdclient.Client, bootIndexDigest string, operation func(context.Context) error) (retErr error) {
+	leaseCtx, done, err := client.WithLease(containerdclient.NewNamespaceContext(ctx))
+	if err != nil {
+		return fmt.Errorf("create Boot Index operation lease: %w", err)
+	}
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(
+			containerdclient.NewNamespaceContext(context.WithoutCancel(ctx)),
+			10*time.Second,
+		)
+		defer cancel()
+		if err := done(cleanupCtx); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("delete Boot Index operation lease: %w", err))
+		}
+	}()
+	leaseID, ok := leases.FromContext(leaseCtx)
+	if !ok {
+		return fmt.Errorf("Boot Index operation lease is missing from context")
+	}
+	lease := leases.Lease{ID: leaseID}
+	if err := client.LeasesService().AddResource(leaseCtx, lease, leases.Resource{Type: "content", ID: bootIndexDigest}); err != nil {
+		return fmt.Errorf("retain Boot Index %s: %w", bootIndexDigest, err)
+	}
+	return operation(leaseCtx)
+}
 
 type BootIndexContentOptions struct {
 	RootfsDescriptor  ocispec.Descriptor
@@ -39,6 +68,7 @@ type BootIndexContentOptions struct {
 	InitrdPath        string
 	VMMName           string
 	MemorySizeMB      int64
+	CPUCount          int64
 }
 
 func BuildBootIndexInContent(ctx context.Context, store content.Store, opts BootIndexContentOptions) (ocispec.Descriptor, error) {
@@ -72,6 +102,9 @@ func BuildBootIndexInContent(ctx context.Context, store content.Store, opts Boot
 	if !hasMem && opts.MemorySizeMB != 0 {
 		return ocispec.Descriptor{}, fmt.Errorf("memory size requires a mem-snapshot component")
 	}
+	if opts.CPUCount < 0 || (!hasMem && opts.CPUCount != 0) {
+		return ocispec.Descriptor{}, fmt.Errorf("CPU count must be positive and requires a mem-snapshot component")
+	}
 
 	rootfsDesc, err := normalizeComponentDescriptor(ctx, store, opts.RootfsDescriptor, KindRootfs, "")
 	if err != nil {
@@ -87,6 +120,9 @@ func BuildBootIndexInContent(ctx context.Context, store content.Store, opts Boot
 		memDesc.Annotations = mergeAnnotations(memDesc.Annotations, map[string]string{
 			AnnotationMemorySizeMB: strconv.FormatInt(opts.MemorySizeMB, 10),
 		})
+		if opts.CPUCount > 0 {
+			memDesc.Annotations[AnnotationCPUCount] = strconv.FormatInt(opts.CPUCount, 10)
+		}
 		manifests = append(manifests, memDesc)
 	}
 
@@ -106,6 +142,9 @@ func BuildBootIndexInContent(ctx context.Context, store content.Store, opts Boot
 		indexAnnotations = map[string]string{
 			AnnotationVMM:          vmmName,
 			AnnotationMemorySizeMB: strconv.FormatInt(opts.MemorySizeMB, 10),
+		}
+		if opts.CPUCount > 0 {
+			indexAnnotations[AnnotationCPUCount] = strconv.FormatInt(opts.CPUCount, 10)
 		}
 	}
 	return writeIndexToContent(ctx, store, manifests, indexAnnotations)
@@ -509,6 +548,8 @@ func inspectBootIndexMetadata(desc ocispec.Descriptor, index ocispec.Index) (Boo
 	memVMM := strings.TrimSpace(info.MemDescriptor.Annotations[AnnotationVMM])
 	indexMemorySize := strings.TrimSpace(index.Annotations[AnnotationMemorySizeMB])
 	memMemorySize := strings.TrimSpace(info.MemDescriptor.Annotations[AnnotationMemorySizeMB])
+	indexCPUCount := strings.TrimSpace(index.Annotations[AnnotationCPUCount])
+	memCPUCount := strings.TrimSpace(info.MemDescriptor.Annotations[AnnotationCPUCount])
 	if info.Resume {
 		if indexVMM == "" || memVMM == "" {
 			return BootIndexInfo{}, fmt.Errorf("resume boot index %s is missing %s capability", desc.Digest, AnnotationVMM)
@@ -517,6 +558,22 @@ func inspectBootIndexMetadata(desc ocispec.Descriptor, index ocispec.Index) (Boo
 			return BootIndexInfo{}, fmt.Errorf("boot index VMM %q does not match mem component VMM %q", indexVMM, memVMM)
 		}
 		info.VMMName = indexVMM
+		switch {
+		case indexCPUCount == "" && memCPUCount == "":
+			// Preserve read access to old artifacts. Admission that requires
+			// exact resource accounting must reject this unknown CPU count.
+		case indexCPUCount == "" || memCPUCount == "":
+			return BootIndexInfo{}, fmt.Errorf("resume boot index %s has incomplete %s metadata", desc.Digest, AnnotationCPUCount)
+		default:
+			if indexCPUCount != memCPUCount {
+				return BootIndexInfo{}, fmt.Errorf("boot index CPU count %q does not match mem component CPU count %q", indexCPUCount, memCPUCount)
+			}
+			cpuCount, err := strconv.ParseInt(indexCPUCount, 10, 64)
+			if err != nil || cpuCount <= 0 {
+				return BootIndexInfo{}, fmt.Errorf("boot index has invalid %s value %q", AnnotationCPUCount, indexCPUCount)
+			}
+			info.CPUCount = cpuCount
+		}
 		switch {
 		case indexMemorySize == "" && memMemorySize == "":
 			// Legacy Cloud Hypervisor indexes can still derive the size from
@@ -540,6 +597,8 @@ func inspectBootIndexMetadata(desc ocispec.Descriptor, index ocispec.Index) (Boo
 		return BootIndexInfo{}, fmt.Errorf("cold boot index %s has unexpected %s capability", desc.Digest, AnnotationVMM)
 	} else if indexMemorySize != "" || memMemorySize != "" {
 		return BootIndexInfo{}, fmt.Errorf("cold boot index %s has unexpected %s capability", desc.Digest, AnnotationMemorySizeMB)
+	} else if indexCPUCount != "" || memCPUCount != "" {
+		return BootIndexInfo{}, fmt.Errorf("cold boot index %s has unexpected %s capability", desc.Digest, AnnotationCPUCount)
 	}
 	return info, nil
 }

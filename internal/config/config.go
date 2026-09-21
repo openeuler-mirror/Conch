@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/opencontainers/go-digest"
 	"github.com/openeuler/Conch/internal/netstack"
 	"github.com/openeuler/Conch/internal/runtimeapi"
 	"github.com/openeuler/Conch/pkg/ulog"
@@ -52,8 +53,9 @@ type ServerConfig struct {
 
 // NetworkConfig holds network pool configuration
 type NetworkConfig struct {
-	WarmPoolSize int       `yaml:"warm_pool_size"`
-	CNI          CNIConfig `yaml:"cni"`
+	WarmPoolSize    int       `yaml:"warm_pool_size"`
+	RefillThreshold int       `yaml:"refill_threshold"`
+	CNI             CNIConfig `yaml:"cni"`
 }
 
 // CNIConfig holds the plugin directories and runtime behavior for outer sandbox networking.
@@ -64,25 +66,33 @@ type VMMBinaryConfig struct {
 }
 
 const (
-	DefaultSandboxBackend = "stratovirt"
-	defaultVolumeBackend  = "virtiofs"
+	DefaultSandboxBackend   = "stratovirt"
+	defaultVolumeBackend    = "virtiofs"
+	defaultMemoryOvercommit = 1.0
+	defaultMemoryLimitMB    = 64 * 1024
+	minMemoryOvercommit     = 1.0
+	maxMemoryOvercommit     = 5.0
+	minMemoryLimitMB        = 128
 )
 
 type SandboxConfig struct {
-	VsockSignalRetry   time.Duration    `yaml:"vsock_signal_retry"`
-	VsockSignalTimeout time.Duration    `yaml:"vsock_signal_timeout"`
-	RequestTimeout     time.Duration    `yaml:"request_timeout"`
-	Backend            string           `yaml:"backend"`
-	DefaultSpec        SandboxSpec      `yaml:"default_spec"`
-	CloudHypervisor    *VMMBinaryConfig `yaml:"cloud_hypervisor"`
-	Stratovirt         *VMMBinaryConfig `yaml:"stratovirt"`
+	VsockSignalRetry      time.Duration    `yaml:"vsock_signal_retry"`
+	VsockSignalTimeout    time.Duration    `yaml:"vsock_signal_timeout"`
+	RequestTimeout        time.Duration    `yaml:"request_timeout"`
+	MemoryOvercommitRatio float64          `yaml:"memory_overcommit_ratio"`
+	MemoryLimitMB         int64            `yaml:"memory_limit_mb"`
+	Backend               string           `yaml:"backend"`
+	DefaultSpec           SandboxSpec      `yaml:"default_spec"`
+	CloudHypervisor       *VMMBinaryConfig `yaml:"cloud_hypervisor"`
+	Stratovirt            *VMMBinaryConfig `yaml:"stratovirt"`
 }
 
 type SandboxSpec struct {
-	TemplateID string `yaml:"template_id"`
-	VCPUNum    int64  `yaml:"vcpu_num"`
-	VCPUMax    int64  `yaml:"vcpu_max"`
-	RamMB      int64  `yaml:"ram_mb"`
+	TemplateName string `yaml:"template_name"`
+	TemplateID   string `yaml:"template_id"`
+	VCPUNum      int64  `yaml:"vcpu_num"`
+	VCPUMax      int64  `yaml:"vcpu_max"`
+	RamMB        int64  `yaml:"ram_mb"`
 }
 
 // BinaryPaths returns the explicitly configured binary for each available VMM.
@@ -122,7 +132,8 @@ func DefaultConfig() *Config {
 			StateDir: defaultStateDir,
 		},
 		Network: NetworkConfig{
-			WarmPoolSize: netstack.DefaultWarmPoolSize,
+			WarmPoolSize:    netstack.DefaultWarmPoolSize,
+			RefillThreshold: netstack.DefaultWarmPoolSize / 2,
 			CNI: CNIConfig{
 				PluginBinDirs: []string{netstack.DefaultCNIPluginBinDir},
 				PluginConfDir: netstack.DefaultCNIPluginConfDir,
@@ -130,10 +141,12 @@ func DefaultConfig() *Config {
 			},
 		},
 		Sandbox: SandboxConfig{
-			VsockSignalRetry:   10 * time.Millisecond,
-			VsockSignalTimeout: 60 * time.Second,
-			RequestTimeout:     60 * time.Second,
-			Backend:            DefaultSandboxBackend,
+			VsockSignalRetry:      10 * time.Millisecond,
+			VsockSignalTimeout:    60 * time.Second,
+			RequestTimeout:        60 * time.Second,
+			MemoryOvercommitRatio: defaultMemoryOvercommit,
+			MemoryLimitMB:         defaultMemoryLimitMB,
+			Backend:               DefaultSandboxBackend,
 			DefaultSpec: SandboxSpec{
 				VCPUNum: 2,
 				VCPUMax: 2,
@@ -164,10 +177,6 @@ func LoadConfig(configPath string) (*Config, error) {
 	// Open the file once so the permission check applies to the same file that is read.
 	file, err := os.Open(configPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			// Config file doesn't exist, use default
-			return DefaultConfig(), nil
-		}
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 	defer file.Close()
@@ -218,6 +227,9 @@ func LoadConfig(configPath string) (*Config, error) {
 	if cfg.Network.WarmPoolSize == 0 {
 		cfg.Network.WarmPoolSize = defaultCfg.Network.WarmPoolSize
 	}
+	if cfg.Network.RefillThreshold == 0 {
+		cfg.Network.RefillThreshold = cfg.Network.WarmPoolSize / 2
+	}
 	if len(cfg.Network.CNI.PluginBinDirs) == 0 {
 		cfg.Network.CNI.PluginBinDirs = defaultCfg.Network.CNI.PluginBinDirs
 	}
@@ -230,6 +242,12 @@ func LoadConfig(configPath string) (*Config, error) {
 	}
 	if cfg.Sandbox.RequestTimeout == 0 {
 		cfg.Sandbox.RequestTimeout = defaultCfg.Sandbox.RequestTimeout
+	}
+	if cfg.Sandbox.MemoryOvercommitRatio == 0 {
+		cfg.Sandbox.MemoryOvercommitRatio = defaultCfg.Sandbox.MemoryOvercommitRatio
+	}
+	if cfg.Sandbox.MemoryLimitMB == 0 {
+		cfg.Sandbox.MemoryLimitMB = defaultCfg.Sandbox.MemoryLimitMB
 	}
 	if cfg.Sandbox.Backend == "" {
 		cfg.Sandbox.Backend = defaultCfg.Sandbox.Backend
@@ -275,9 +293,32 @@ func validateConfig(cfg *Config) error {
 	if cfg.Network.WarmPoolSize < 0 {
 		return fmt.Errorf("invalid network.warm_pool_size=%d: must be greater than or equal to 0", cfg.Network.WarmPoolSize)
 	}
+	if cfg.Network.RefillThreshold < 0 || cfg.Network.RefillThreshold >= cfg.Network.WarmPoolSize {
+		return fmt.Errorf("invalid network.refill_threshold=%d: must be within [0, %d)", cfg.Network.RefillThreshold, cfg.Network.WarmPoolSize)
+	}
 	if cfg.Volume.MaxMounts < 0 {
 		return fmt.Errorf("invalid volume.max_mounts=%d: must be greater than or equal to 0", cfg.Volume.MaxMounts)
 	}
+	if !(cfg.Sandbox.MemoryOvercommitRatio >= minMemoryOvercommit && cfg.Sandbox.MemoryOvercommitRatio <= maxMemoryOvercommit) {
+		return fmt.Errorf("invalid sandbox.memory_overcommit_ratio=%g: must be between %g and %g", cfg.Sandbox.MemoryOvercommitRatio, minMemoryOvercommit, maxMemoryOvercommit)
+	}
+	if cfg.Sandbox.MemoryLimitMB < minMemoryLimitMB {
+		return fmt.Errorf("invalid sandbox.memory_limit_mb=%d: must be at least %d", cfg.Sandbox.MemoryLimitMB, minMemoryLimitMB)
+	}
+	templateName := strings.TrimSpace(cfg.Sandbox.DefaultSpec.TemplateName)
+	templateID := strings.TrimSpace(cfg.Sandbox.DefaultSpec.TemplateID)
+	if templateName != "" && templateID != "" {
+		return fmt.Errorf("sandbox.default_spec.template_name and sandbox.default_spec.template_id are mutually exclusive")
+	}
+	if templateID != "" {
+		parsed, err := digest.Parse(templateID)
+		if err != nil {
+			return fmt.Errorf("invalid sandbox.default_spec.template_id %q: %w", templateID, err)
+		}
+		templateID = parsed.String()
+	}
+	cfg.Sandbox.DefaultSpec.TemplateName = templateName
+	cfg.Sandbox.DefaultSpec.TemplateID = templateID
 	backend := strings.TrimSpace(cfg.Volume.Backend)
 	if backend != "" && backend != defaultVolumeBackend {
 		return fmt.Errorf("invalid volume.backend=%q: only %q is supported", cfg.Volume.Backend, defaultVolumeBackend)
@@ -366,8 +407,6 @@ func (c *Config) ContainerdRootDir() string { return filepath.Join(c.Server.Stat
 func (c *Config) ContainerdStateDir() string { return filepath.Join(c.Server.WorkDir, "containerd") }
 
 func (c *Config) VirtiofsRuntimeDir() string { return filepath.Join(c.Server.WorkDir, "sandboxes") }
-
-func (c *Config) StatePath() string { return filepath.Join(c.Server.StateDir, "state.db") }
 
 // parseLogLevel converts string log level to ulog.LogLevel
 func parseLogLevel(level string) (ulog.LogLevel, error) {

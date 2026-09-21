@@ -19,12 +19,11 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/openeuler/Conch/internal/adapters/containerd/client"
-	"github.com/openeuler/Conch/internal/adapters/containerd/host"
+	containerdclient "github.com/openeuler/Conch/internal/adapters/containerd/client"
+	containerdhost "github.com/openeuler/Conch/internal/adapters/containerd/host"
 	"github.com/openeuler/Conch/internal/cleanupdiag"
 	"github.com/openeuler/Conch/internal/conchruntime"
 	"github.com/openeuler/Conch/internal/config"
-	"github.com/openeuler/Conch/internal/daemon/state"
 	conchimage "github.com/openeuler/Conch/internal/image"
 	"github.com/openeuler/Conch/internal/netstack"
 	"github.com/openeuler/Conch/internal/runtimeapi"
@@ -32,6 +31,7 @@ import (
 	conchsnapshot "github.com/openeuler/Conch/internal/snapshot"
 	"github.com/openeuler/Conch/internal/util"
 	"github.com/openeuler/Conch/internal/volume"
+	"github.com/openeuler/Conch/internal/webhook"
 	"github.com/openeuler/Conch/pkg/ulog"
 )
 
@@ -47,16 +47,15 @@ const (
 )
 
 type Daemon struct {
-	router         *http.ServeMux
-	containerdHost *containerdhost.Host
-	stateStore     state.Store
-	runtimeService *conchruntime.Service
-	volumeManager  *volume.Manager
-	daemonClient   *containerdclient.Client
-	httpServer     *http.Server
-	listener       net.Listener
-	unixSocketPath string
-	cleanupOnce    sync.Once
+	router            *http.ServeMux
+	containerdHost    *containerdhost.Host
+	sandboxStore      conchsandbox.Store
+	runtimeService    *conchruntime.Service
+	webhookDispatcher *webhook.Dispatcher
+	volumeManager     *volume.Manager
+	daemonClient      *containerdclient.Client
+	httpServer        *http.Server
+	cleanupOnce       sync.Once
 
 	// TODO: need ListCachedBuilds()
 }
@@ -97,22 +96,20 @@ func handleSignals(ctx context.Context, cancel context.CancelFunc, s *Daemon) {
 }
 
 func New(cfg *config.Config) (*Daemon, error) {
+	if err := ensureProcessTempDir(); err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 
 	s := &Daemon{
 		router: http.NewServeMux(),
 	}
 	s.routes()
+	s.httpServer = newHTTPServer(s.router)
 
 	logger := ulog.GetLogger()
 
-	store, err := state.OpenBolt(cfg.StatePath())
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("open state store: %w", err)
-	}
-	s.stateStore = store
-	logger.Info("State store initialized", ulog.F("path", cfg.StatePath()))
+	var err error
 	s.volumeManager, err = volume.NewManager(volume.Config{
 		MaxMounts: cfg.Volume.MaxMounts,
 		Backend:   cfg.Volume.Backend,
@@ -127,51 +124,55 @@ func New(cfg *config.Config) (*Daemon, error) {
 	}
 
 	host, err := containerdhost.Start(ctx, containerdhost.Config{
-		RootDir:       cfg.ContainerdRootDir(),
-		StateDir:      cfg.ContainerdStateDir(),
-		TemplateStore: store,
+		RootDir:  cfg.ContainerdRootDir(),
+		StateDir: cfg.ContainerdStateDir(),
 		Snapshot: containerdhost.SnapshotConfig{
 			WorkDir: cfg.Server.WorkDir,
 		},
 		Sandbox: &conchsandbox.Config{
 			Network: netstack.PoolConfig{
-				WarmPoolSize: cfg.Network.WarmPoolSize,
-				CNI:          cfg.Network.CNI,
+				WarmPoolSize:    cfg.Network.WarmPoolSize,
+				RefillThreshold: cfg.Network.RefillThreshold,
+				CNI:             cfg.Network.CNI,
 			},
-			VMMBinaries:        cfg.Sandbox.BinaryPaths(),
-			VsockSignalRetry:   cfg.Sandbox.VsockSignalRetry,
-			VsockSignalTimeout: cfg.Sandbox.VsockSignalTimeout,
-			RequestTimeout:     cfg.Sandbox.RequestTimeout,
-			VolumeManager:      s.volumeManager,
+			VMMBinaries:           cfg.Sandbox.BinaryPaths(),
+			VsockSignalRetry:      cfg.Sandbox.VsockSignalRetry,
+			VsockSignalTimeout:    cfg.Sandbox.VsockSignalTimeout,
+			RequestTimeout:        cfg.Sandbox.RequestTimeout,
+			MemoryOvercommitRatio: cfg.Sandbox.MemoryOvercommitRatio,
+			MemoryLimitMB:         cfg.Sandbox.MemoryLimitMB,
+			VolumeManager:         s.volumeManager,
 		},
 	})
 	if err != nil {
 		cancel()
-		_ = store.Close()
 		logger.Error("Failed to init embedded containerd host", ulog.F("error", err))
 		return nil, fmt.Errorf("failed to init embedded containerd host: %w", err)
 	}
 	s.containerdHost = host
+	s.sandboxStore = host.SandboxStore()
 	daemonClient := host.Client()
 	s.daemonClient = daemonClient
 
-	s.runtimeService = conchruntime.New(host.SandboxManager(), host.Client(), store)
+	s.runtimeService = conchruntime.New(host.SandboxManager(), host.Client())
+	s.webhookDispatcher = webhook.NewDispatcher()
+	host.SandboxManager().WebhookDispatcher = s.webhookDispatcher
 	s.runtimeService.Snapshot = host.SnapshotServer()
 	s.runtimeService.Templates = host.TemplateStore()
 	s.runtimeService.SetSandboxDefaults(runtimeapi.SandboxDefaults{
-		TemplateID: cfg.Sandbox.DefaultSpec.TemplateID,
-		VMMName:    cfg.Sandbox.Backend,
-		VCPUNum:    cfg.Sandbox.DefaultSpec.VCPUNum,
-		VCPUMax:    cfg.Sandbox.DefaultSpec.VCPUMax,
-		RamMB:      cfg.Sandbox.DefaultSpec.RamMB,
+		TemplateName: cfg.Sandbox.DefaultSpec.TemplateName,
+		TemplateID:   cfg.Sandbox.DefaultSpec.TemplateID,
+		VMMName:      cfg.Sandbox.Backend,
+		VCPUNum:      cfg.Sandbox.DefaultSpec.VCPUNum,
+		VCPUMax:      cfg.Sandbox.DefaultSpec.VCPUMax,
+		RamMB:        cfg.Sandbox.DefaultSpec.RamMB,
 	})
 
 	manager := host.SandboxManager()
 	if manager != nil {
-		records, err := store.ListSandboxes(ctx)
+		records, err := s.sandboxStore.List(ctx, conchsandbox.Filter{})
 		if err != nil {
 			cleanupErr := host.Close()
-			_ = store.Close()
 			cancel()
 			return nil, errors.Join(fmt.Errorf("list stale sandboxes during startup: %w", err), cleanupErr)
 		}
@@ -179,8 +180,8 @@ func New(cfg *config.Config) (*Daemon, error) {
 		vmmPIDs := make([]int, 0, len(records))
 		hasCreatingSandbox := false
 		for _, record := range records {
-			sandboxIDs = append(sandboxIDs, record.SandboxID)
-			if record.State == state.SandboxCreating {
+			sandboxIDs = append(sandboxIDs, record.ID)
+			if record.State == conchsandbox.StateCreating {
 				hasCreatingSandbox = true
 			}
 			if record.VMMPID > 0 {
@@ -190,19 +191,11 @@ func New(cfg *config.Config) (*Daemon, error) {
 		logger.Info("cleaning up resources from abnormal sandbox exits")
 		if err := manager.RecoverStaleResources(ctx, sandboxIDs, vmmPIDs, hasCreatingSandbox); err != nil {
 			cleanupErr := host.Close()
-			_ = store.Close()
 			cancel()
 			return nil, errors.Join(fmt.Errorf("recover stale sandbox resources during startup: %w", err), cleanupErr)
 		}
-		if err := s.removeAllSandboxes(); err != nil {
-			cleanupErr := host.Close()
-			_ = store.Close()
-			cancel()
-			return nil, errors.Join(fmt.Errorf("clean up stale sandboxes during startup: %w", err), cleanupErr)
-		}
 		if err := manager.Start(ctx); err != nil {
 			cleanupErr := host.Close()
-			_ = store.Close()
 			cancel()
 			return nil, errors.Join(fmt.Errorf("start network pool during startup: %w", err), cleanupErr)
 		}
@@ -214,7 +207,18 @@ func New(cfg *config.Config) (*Daemon, error) {
 	return s, nil
 }
 
+func ensureProcessTempDir() error {
+	tmpDir := os.TempDir()
+	if err := os.MkdirAll(tmpDir, 0o700); err != nil {
+		return fmt.Errorf("create process temp directory %s: %w", tmpDir, err)
+	}
+	return nil
+}
+
 func (s *Daemon) routes() {
+	s.router.HandleFunc("POST /api/v1/events/webhooks", s.handleCreateWebhook)
+	s.router.HandleFunc("GET /api/v1/events/webhooks", s.handleListWebhooks)
+	s.router.HandleFunc("DELETE /api/v1/events/webhooks/{webhookID}", s.handleDeleteWebhook)
 	// sandbox
 	s.router.HandleFunc("GET /api/v1/sandboxes", s.handleListSandbox)
 	s.router.HandleFunc("POST /api/v1/sandboxes", s.handleCreateSandbox)
@@ -243,6 +247,16 @@ func (s *Daemon) routes() {
 	s.router.HandleFunc("/api/image/list", s.handleListImage)
 	s.router.HandleFunc("/api/image/remove", s.handleRemoveImage)
 }
+
+func newHTTPServer(h http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: serverReadHeaderTimeout,
+		IdleTimeout:       serverIdleTimeout,
+		MaxHeaderBytes:    serverMaxHeaderBytes,
+	}
+}
+
 func (s *Daemon) Start(unixSocket string) error {
 	logger := ulog.GetLogger()
 
@@ -252,7 +266,7 @@ func (s *Daemon) Start(unixSocket string) error {
 
 	// First create the parent directory if needed; this requires permission for the socket path.
 	// Then for any existing stale socket it should be removed before start to listen
-	if err := os.MkdirAll(filepath.Dir(unixSocket), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(unixSocket), 0o750); err != nil {
 		return fmt.Errorf("failed to create unix socket directory: %w", err)
 	}
 	if err := os.Remove(unixSocket); err != nil && !os.IsNotExist(err) {
@@ -265,22 +279,14 @@ func (s *Daemon) Start(unixSocket string) error {
 	}
 	if err := os.Chmod(unixSocket, 0o660); err != nil {
 		_ = ln.Close()
-		_ = os.Remove(unixSocket)
 		return fmt.Errorf("failed to set unix socket permissions: %w", err)
 	}
 
-	s.unixSocketPath = unixSocket
 	logger.Info("Starting HTTP server", ulog.F("network", "unix"), ulog.F("socket", unixSocket))
 
-	s.listener = ln
-	s.httpServer = &http.Server{
-		Handler:           s.router,
-		ReadHeaderTimeout: serverReadHeaderTimeout,
-		IdleTimeout:       serverIdleTimeout,
-		MaxHeaderBytes:    serverMaxHeaderBytes,
-	}
 	// Listener is bound, so clients can connect before Serve accepts.
 	util.NotifyReady()
+	// Serve refuses to start once Shutdown has run, and closes ln on return.
 	err = s.httpServer.Serve(ln)
 	if err == http.ErrServerClosed {
 		logger.Info("Main server gracefully stopped")
@@ -303,7 +309,7 @@ func (s *Daemon) Shutdown() {
 		// Report deactivating while cleanup runs; TimeoutStopSec still applies.
 		util.NotifyStopping()
 
-		// stop httpServer
+		// Stops a Serve that has not started yet, and unlinks the socket.
 		if s.httpServer != nil {
 			finish := cleanupdiag.Start("daemon.http.shutdown", ulog.F("timeout", shutdownTimeout.String()))
 			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
@@ -317,21 +323,7 @@ func (s *Daemon) Shutdown() {
 			}
 		}
 
-		if s.unixSocketPath != "" {
-			finish := cleanupdiag.Start("daemon.http.remove_socket", ulog.F("socket", s.unixSocketPath))
-			err := os.Remove(s.unixSocketPath)
-			if err != nil && os.IsNotExist(err) {
-				err = nil
-			}
-			finish(err)
-			if err != nil {
-				logger.Error("Failed to remove unix socket", ulog.F("socket", s.unixSocketPath), ulog.F("error", err))
-			} else {
-				logger.Info("Removed unix socket", ulog.F("socket", s.unixSocketPath))
-			}
-		}
-
-		if s.runtimeService != nil && s.stateStore != nil {
+		if s.runtimeService != nil && s.sandboxStore != nil {
 			finish := cleanupdiag.Start("daemon.sandboxes.remove_all")
 			err := s.removeAllSandboxes()
 			finish(err)
@@ -356,29 +348,21 @@ func (s *Daemon) Shutdown() {
 			}
 		}
 
-		if s.stateStore != nil {
-			finish := cleanupdiag.Start("daemon.state_store.close")
-			err := s.stateStore.Close()
-			finish(err)
-			if err != nil {
-				logger.Error("State store cleanup error", ulog.F("error", err))
-			}
-		}
 		logger.Info("Cleanup completed")
 	})
 }
 
 // removeAllSandboxes removes runtime resources and persistent records.
 func (s *Daemon) removeAllSandboxes() error {
-	records, err := s.stateStore.ListSandboxes(context.Background())
+	records, err := s.sandboxStore.List(context.Background(), conchsandbox.Filter{})
 	if err != nil {
 		return fmt.Errorf("list sandboxes for shutdown: %w", err)
 	}
 
 	var errs []error
 	for _, record := range records {
-		if err := s.runtimeService.RemoveSandbox(context.Background(), record.SandboxID); err != nil {
-			errs = append(errs, fmt.Errorf("remove sandbox %s: %w", record.SandboxID, err))
+		if err := s.runtimeService.RemoveSandbox(context.Background(), record.ID); err != nil {
+			errs = append(errs, fmt.Errorf("remove sandbox %s: %w", record.ID, err))
 		}
 	}
 	return errors.Join(errs...)
@@ -398,12 +382,11 @@ func (s *Daemon) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Daemon) controlPlaneReady() bool {
 	return s != nil &&
-		s.stateStore != nil &&
+		s.sandboxStore != nil &&
 		s.containerdHost != nil &&
 		s.daemonClient != nil &&
 		s.runtimeService != nil &&
-		s.runtimeService.Sandbox != nil &&
-		s.runtimeService.Store != nil
+		s.runtimeService.Sandbox != nil
 }
 
 func (s *Daemon) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
@@ -431,7 +414,7 @@ func (s *Daemon) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := s.runtimeService.CreateSandbox(r.Context(), runtimeapi.SandboxCreateOptions{
 		SandboxID:    req.SandboxID,
-		LeaseID:      req.LeaseID,
+		TemplateName: req.TemplateName,
 		TemplateID:   req.TemplateID,
 		VMMName:      req.VMMName,
 		VCPUNum:      req.VCPUNum,
@@ -455,6 +438,76 @@ func (s *Daemon) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(sandboxResponseFromCreate(result))
 }
 
+// Webhook management handlers configure the daemon-local in-memory dispatcher.
+func (s *Daemon) handleCreateWebhook(w http.ResponseWriter, r *http.Request) {
+	logger := ulog.GetLogger()
+	logger.Debug("Handling create webhook request")
+
+	if s.webhookDispatcher == nil {
+		writeAPIError(w, errServiceUnavailable.New())
+		return
+	}
+	var req webhookCreateRequest
+	if !decodeJSONBody(w, r, &req) {
+		return
+	}
+	hook, err := s.webhookDispatcher.Create(runtimeapi.WebhookCreateOptions{
+		Name: req.Name, URL: req.URL, Events: req.Events,
+	})
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	logger.Info("Webhook created successfully", ulog.F("webhook_id", hook.WebhookID), ulog.F("webhook_name", hook.Name))
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(webhookResponseFromRecord(hook))
+}
+
+func (s *Daemon) handleListWebhooks(w http.ResponseWriter, r *http.Request) {
+	logger := ulog.GetLogger()
+	logger.Debug("Handling list webhooks request")
+
+	if s.webhookDispatcher == nil {
+		writeAPIError(w, errServiceUnavailable.New())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	records := s.webhookDispatcher.List()
+	hooks := make([]webhookResponse, 0, len(records))
+	for _, record := range records {
+		hooks = append(hooks, webhookResponseFromRecord(record))
+	}
+	logger.Debug("Webhooks listed successfully", ulog.F("webhook_count", len(hooks)))
+	_ = json.NewEncoder(w).Encode(listWebhooksResponse{Webhooks: hooks})
+}
+
+func webhookResponseFromRecord(record runtimeapi.WebhookRecord) webhookResponse {
+	return webhookResponse{
+		WebhookID: record.WebhookID, Name: record.Name, URL: record.URL,
+		Events:    append([]string(nil), record.Events...),
+		CreatedAt: record.CreatedAt.UTC().Format(time.RFC3339),
+	}
+}
+
+func (s *Daemon) handleDeleteWebhook(w http.ResponseWriter, r *http.Request) {
+	logger := ulog.GetLogger()
+	webhookID := strings.TrimSpace(r.PathValue("webhookID"))
+	logger.Debug("Handling delete webhook request", ulog.F("webhook_id", webhookID))
+
+	if s.webhookDispatcher == nil {
+		writeAPIError(w, errServiceUnavailable.New())
+		return
+	}
+	if webhookID == "" || !s.webhookDispatcher.Delete(webhookID) {
+		writeAPIError(w, webhook.ErrNotFound.New())
+		return
+	}
+	logger.Info("Webhook deleted successfully", ulog.F("webhook_id", webhookID))
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(deleteWebhookResponse{WebhookID: webhookID, Status: "deleted"})
+}
+
 func (s *Daemon) handleUpdateSandboxNetwork(w http.ResponseWriter, r *http.Request) {
 	sandboxID := r.PathValue("sandboxID")
 	if sandboxID == "" {
@@ -465,7 +518,7 @@ func (s *Daemon) handleUpdateSandboxNetwork(w http.ResponseWriter, r *http.Reque
 	if !decodeJSONBody(w, r, &req) {
 		return
 	}
-	if s.stateStore == nil || s.runtimeService == nil {
+	if s.sandboxStore == nil || s.runtimeService == nil {
 		writeAPIError(w, errServiceUnavailable.New())
 		return
 	}
@@ -479,7 +532,7 @@ func (s *Daemon) handleUpdateSandboxNetwork(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if err := s.runtimeService.UpdateSandboxNetworkConfig(r.Context(), runtimeapi.SandboxNetworkUpdateOptions{
-		SandboxID: record.SandboxID,
+		SandboxID: record.ID,
 		Network:   &req,
 	}); err != nil {
 		writeAPIError(w, err)
@@ -501,7 +554,7 @@ func (s *Daemon) handleDeleteSandbox(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, conchsandbox.ErrInvalidArgument.Wrap(errors.New("sandbox id is required")))
 		return
 	}
-	if s.stateStore == nil || s.runtimeService == nil {
+	if s.sandboxStore == nil || s.runtimeService == nil {
 		writeAPIError(w, errServiceUnavailable.New())
 		return
 	}
@@ -515,7 +568,7 @@ func (s *Daemon) handleDeleteSandbox(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, conchsandbox.ErrNotFound.New())
 		return
 	}
-	if err := s.runtimeService.RemoveSandbox(r.Context(), record.SandboxID); err != nil {
+	if err := s.runtimeService.RemoveSandbox(r.Context(), record.ID); err != nil {
 		writeAPIError(w, err, ulog.F("operation", "sandbox.delete"), ulog.F("sandbox_id", sandboxID))
 		return
 	}
@@ -525,7 +578,7 @@ func (s *Daemon) handleDeleteSandbox(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Daemon) handleListSandbox(w http.ResponseWriter, r *http.Request) {
-	if s.stateStore == nil {
+	if s.sandboxStore == nil {
 		writeAPIError(w, errServiceUnavailable.New())
 		return
 	}
@@ -539,7 +592,7 @@ func (s *Daemon) handleListSandbox(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, conchsandbox.ErrInvalidArgument.WrapMessage(err, "invalid sandbox list limit"))
 		return
 	}
-	records, err := s.stateStore.ListSandboxes(r.Context())
+	records, err := s.sandboxStore.List(r.Context(), conchsandbox.Filter{})
 	if err != nil {
 		writeAPIError(w, err)
 		return
@@ -558,7 +611,7 @@ func (s *Daemon) handleListSandbox(w http.ResponseWriter, r *http.Request) {
 
 func (s *Daemon) handleGetSandbox(w http.ResponseWriter, r *http.Request) {
 	sandboxID := r.PathValue("sandboxID")
-	if s.stateStore == nil {
+	if s.sandboxStore == nil {
 		writeAPIError(w, errServiceUnavailable.New())
 		return
 	}
@@ -567,25 +620,22 @@ func (s *Daemon) handleGetSandbox(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, err)
 		return
 	}
-	if record == nil {
+	if record == nil || record.State == conchsandbox.StateUnknown {
 		writeAPIError(w, conchsandbox.ErrNotFound.New())
 		return
 	}
 	writeJSON(w, sandboxResponseFromRecord(*record, true))
 }
 
-func (s *Daemon) findSandboxRecord(ctx context.Context, sandboxID string) (*state.SandboxRecord, error) {
-	records, err := s.stateStore.ListSandboxes(ctx)
+func (s *Daemon) findSandboxRecord(ctx context.Context, sandboxID string) (*conchsandbox.Record, error) {
+	record, err := s.sandboxStore.Get(ctx, sandboxID)
+	if errors.Is(err, conchsandbox.ErrNotFound) {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
-	for i := range records {
-		if records[i].SandboxID != sandboxID {
-			continue
-		}
-		return &records[i], nil
-	}
-	return nil, nil
+	return &record, nil
 }
 
 func parseSandboxStates(values []string) (map[string]bool, error) {
@@ -613,21 +663,22 @@ func parseSandboxListLimit(raw string) (int, error) {
 	return limit, nil
 }
 
-func matchesSandboxState(record state.SandboxRecord, states map[string]bool) bool {
-	running := record.State == state.SandboxReady
-	paused := record.State == state.SandboxSuspended
+func matchesSandboxState(record conchsandbox.Record, states map[string]bool) bool {
+	running := record.State == conchsandbox.StateReady
+	paused := record.State == conchsandbox.StateSuspended
 	if len(states) == 0 {
 		return running || paused
 	}
 	return states["running"] && running || states["paused"] && paused
 }
 
-func sandboxResponseFromRecord(record state.SandboxRecord, detailed bool) sandboxInspectResponse {
+func sandboxResponseFromRecord(record conchsandbox.Record, detailed bool) sandboxInspectResponse {
 	response := sandboxInspectResponse{
+		TemplateName: record.SourceTemplateName,
 		TemplateID:   record.SourceTemplateID,
 		ImageName:    "",
 		SnapshotID:   "",
-		SandboxID:    record.SandboxID,
+		SandboxID:    record.ID,
 		StartedAt:    formatUnixNanoRFC3339(record.CreatedAt),
 		CPUCount:     record.VCPUNum,
 		MemoryMB:     record.RamMB,
@@ -650,6 +701,7 @@ func sandboxResponseFromRecord(record state.SandboxRecord, detailed bool) sandbo
 func sandboxResponseFromCreate(result runtimeapi.SandboxCreateResult) createSandboxResponse {
 	// TODO: populate conchInitVersion and alias when runtime support is available.
 	return createSandboxResponse{
+		TemplateName:         result.TemplateName,
 		TemplateID:           result.TemplateID,
 		SandboxID:            result.SandboxID,
 		ConchInitAccessToken: result.AgentToken,
@@ -681,7 +733,7 @@ func (s *Daemon) handleSuspendSandbox(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, conchsandbox.ErrInvalidArgument.Wrap(errors.New("sandbox_id is required")))
 		return
 	}
-	if s.stateStore == nil || s.runtimeService == nil {
+	if s.sandboxStore == nil || s.runtimeService == nil {
 		writeAPIError(w, errServiceUnavailable.New())
 		return
 	}
@@ -695,7 +747,7 @@ func (s *Daemon) handleSuspendSandbox(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, conchsandbox.ErrNotFound.New())
 		return
 	}
-	err = s.runtimeService.SuspendSandbox(r.Context(), record.SandboxID)
+	err = s.runtimeService.SuspendSandbox(r.Context(), record.ID)
 	if err != nil {
 		writeAPIError(w, err, ulog.F("operation", "sandbox.suspend"), ulog.F("sandbox_id", req.SandboxID))
 		return
@@ -720,7 +772,7 @@ func (s *Daemon) handleResumeSandbox(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, conchsandbox.ErrInvalidArgument.Wrap(errors.New("sandbox_id is required")))
 		return
 	}
-	if s.stateStore == nil || s.runtimeService == nil {
+	if s.sandboxStore == nil || s.runtimeService == nil {
 		writeAPIError(w, errServiceUnavailable.New())
 		return
 	}
@@ -733,7 +785,7 @@ func (s *Daemon) handleResumeSandbox(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, conchsandbox.ErrNotFound.New())
 		return
 	}
-	if err := s.runtimeService.ResumeSandbox(r.Context(), record.SandboxID); err != nil {
+	if err := s.runtimeService.ResumeSandbox(r.Context(), record.ID); err != nil {
 		writeAPIError(w, err)
 		return
 	}
@@ -759,8 +811,9 @@ func (s *Daemon) handleCheckpointSandbox(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	result, err := s.runtimeService.CheckpointSandbox(r.Context(), runtimeapi.SandboxCheckpointOptions{
-		SandboxID: req.SandboxID,
-		Labels:    req.Labels,
+		SandboxID:    req.SandboxID,
+		TemplateName: req.TemplateName,
+		Labels:       req.Labels,
 	})
 	if err != nil {
 		writeAPIError(w, err)
@@ -820,14 +873,15 @@ func (s *Daemon) handleCreateTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]string{
-		"status":      "ok",
-		"template_id": result.TemplateID,
-		"build_ref":   result.BuildRef,
+		"status":        "ok",
+		"template_name": result.Name,
+		"template_id":   result.TemplateID,
 	})
 }
 
 func (s *Daemon) createTemplate(ctx context.Context, req templateCreateRequest, kernelPath, initrdPath string) (runtimeapi.TemplateCreateResult, error) {
 	return s.runtimeService.CreateTemplate(ctx, runtimeapi.TemplateCreateOptions{
+		Name:       req.Name,
 		Source:     req.Source,
 		KernelPath: kernelPath,
 		InitrdPath: initrdPath,
@@ -859,9 +913,9 @@ func (s *Daemon) handlePullTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]string{
-		"status":      "ok",
-		"template_id": result.TemplateID,
-		"build_ref":   result.BuildRef,
+		"status":        "ok",
+		"template_name": result.Name,
+		"template_id":   result.TemplateID,
 	})
 }
 
@@ -875,7 +929,7 @@ func (s *Daemon) handlePushTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.runtimeService.PushTemplate(r.Context(), runtimeapi.TemplatePushOptions{
-		TemplateID:      req.TemplateID,
+		Name:            req.Name,
 		RemoteReference: req.RemoteReference,
 		PlainHTTP:       req.PlainHTTP,
 		Username:        req.Username,
@@ -897,7 +951,7 @@ func (s *Daemon) handleUnpackTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.runtimeService.UnpackTemplate(r.Context(), runtimeapi.TemplateUnpackOptions{
-		TemplateID: req.TemplateID,
+		Name: req.Name,
 	}); err != nil {
 		writeAPIError(w, err)
 		return
@@ -926,7 +980,7 @@ func (s *Daemon) handleListTemplate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Daemon) handleInspectTemplate(w http.ResponseWriter, r *http.Request) {
-	var req templateIDRequest
+	var req templateNameRequest
 	if !decodePostJSON(w, r, &req) {
 		return
 	}
@@ -934,7 +988,7 @@ func (s *Daemon) handleInspectTemplate(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, errServiceUnavailable.New())
 		return
 	}
-	item, err := s.runtimeService.GetTemplate(r.Context(), req.ID)
+	item, err := s.runtimeService.GetTemplate(r.Context(), req.Name)
 	if err != nil {
 		writeAPIError(w, err)
 		return
@@ -943,7 +997,7 @@ func (s *Daemon) handleInspectTemplate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Daemon) handleRemoveTemplate(w http.ResponseWriter, r *http.Request) {
-	var req templateIDRequest
+	var req templateNameRequest
 	if !decodePostJSON(w, r, &req) {
 		return
 	}
@@ -951,7 +1005,7 @@ func (s *Daemon) handleRemoveTemplate(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, errServiceUnavailable.New())
 		return
 	}
-	if err := s.runtimeService.RemoveTemplate(r.Context(), req.ID); err != nil {
+	if err := s.runtimeService.RemoveTemplate(r.Context(), req.Name); err != nil {
 		writeAPIError(w, err)
 		return
 	}

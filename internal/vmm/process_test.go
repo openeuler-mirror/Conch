@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/openeuler/Conch/internal/config"
+	"github.com/openeuler/Conch/internal/vmm/driver"
 )
 
 func TestSandboxSocketPathUsesShortStableName(t *testing.T) {
@@ -107,35 +108,37 @@ func TestMatchesConfiguredVMMCommand(t *testing.T) {
 type blockingDaemonClient struct {
 	release      chan struct{}
 	cleanupCalls atomic.Int32
+	deleteCalls  atomic.Int32
 }
 
 func (c *blockingDaemonClient) BuildStartCmd(*ResourceArgs, bool) (string, error) { return "", nil }
-func (c *blockingDaemonClient) CheckAgentAlive(ctx context.Context, processExited <-chan error) error {
+func (c *blockingDaemonClient) CheckAgentAlive(ctx context.Context, processExited driver.ProcessExit) error {
 	select {
 	case <-c.release:
 		return nil
-	case waitErr, ok := <-processExited:
-		if !ok || waitErr == nil {
+	case <-processExited.Done():
+		if waitErr := processExited.Err(); waitErr == nil {
 			return errors.New("vmm process exited before conch-init became ready")
+		} else {
+			return errors.Join(errors.New("vmm process exited before conch-init became ready"), waitErr)
 		}
-		return errors.Join(errors.New("vmm process exited before conch-init became ready"), waitErr)
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 func (c *blockingDaemonClient) PauseVM() error                  { return nil }
 func (c *blockingDaemonClient) ResumeVM() error                 { return nil }
-func (c *blockingDaemonClient) DeleteVM() error                 { return nil }
+func (c *blockingDaemonClient) DeleteVM() error                 { c.deleteCalls.Add(1); return nil }
 func (c *blockingDaemonClient) CreateSnapshot(string) error     { return nil }
 func (c *blockingDaemonClient) LoadSnapshot(string, bool) error { return nil }
 func (c *blockingDaemonClient) PrepareLaunch(*ResourceArgs, bool) error {
 	return nil
 }
 func (c *blockingDaemonClient) AfterProcessStart() {}
-func (c *blockingDaemonClient) WaitForCreateReady(context.Context, <-chan error) error {
+func (c *blockingDaemonClient) WaitForCreateReady(context.Context, driver.ProcessExit) error {
 	return nil
 }
-func (c *blockingDaemonClient) WaitForRestoreReady(context.Context, <-chan error) error {
+func (c *blockingDaemonClient) WaitForRestoreReady(context.Context, driver.ProcessExit) error {
 	return nil
 }
 func (c *blockingDaemonClient) Cleanup() { c.cleanupCalls.Add(1) }
@@ -151,12 +154,12 @@ func TestStopIgnoresProcessDoneWhenProcessAlreadyFinished(t *testing.T) {
 
 	client := &blockingDaemonClient{release: make(chan struct{})}
 	process := &Process{
-		cmd:        cmd,
-		adapter:    client,
-		exitSignal: make(chan error, 1),
+		cmd:      cmd,
+		adapter:  client,
+		exitDone: make(chan struct{}),
 	}
 
-	if err := process.Stop(); err != nil {
+	if err := process.Stop(context.Background()); err != nil {
 		t.Fatalf("Stop() error = %v, want nil", err)
 	}
 	if got := client.cleanupCalls.Load(); got != 1 {
@@ -168,14 +171,13 @@ func TestWaitForAgentAliveReturnsProcessExitError(t *testing.T) {
 	processErr := errors.New("stratovirt exited after creating qmp socket")
 	client := &blockingDaemonClient{release: make(chan struct{})}
 	process := &Process{
-		adapter:    client,
-		exitSignal: make(chan error, 1),
+		adapter:  client,
+		exitDone: make(chan struct{}),
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	process.exitSignal <- processErr
-	close(process.exitSignal)
+	process.recordExit(processErr)
 	t.Cleanup(func() { close(client.release) })
 
 	err := process.waitForAgentAlive(ctx)
@@ -184,5 +186,38 @@ func TestWaitForAgentAliveReturnsProcessExitError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "exited before conch-init became ready") {
 		t.Fatalf("waitForAgentAlive() error = %q, want early exit context", err.Error())
+	}
+}
+
+func TestStopRetainsResourcesUntilExit(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+	client := &blockingDaemonClient{}
+	socket := filepath.Join(t.TempDir(), "control")
+	if err := os.WriteFile(socket, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	process := &Process{cmd: cmd, adapter: client, exitDone: make(chan struct{}), apiReady: true, VmmSocketPath: socket}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	// The reaper has not confirmed exit, even if SIGTERM has been delivered.
+	if err := process.Stop(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	if client.deleteCalls.Load() != 1 {
+		t.Fatal("stop did not call control API")
+	}
+	if client.cleanupCalls.Load() != 0 {
+		t.Fatal("cleaned resources before exit")
+	}
+	close(process.exitDone)
+	if err := process.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if client.cleanupCalls.Load() != 1 {
+		t.Fatal("resources were not cleaned after exit")
 	}
 }

@@ -39,7 +39,7 @@ const startScriptCLH = `{{ .NSenterPath }} --net={{ .NetNSPath }} -- \
 {{ .PmemArgs }} \
 --memory "size=0" \
 --memory-zone "id=mem0,size={{ .MemorySize }},file={{ .MemoryPath }},shared=on" \
---cmdline "console=hvc0 root=/dev/ram0 rw debug conch.sandbox_id={{ .SandboxId }}{{ .SharefsCmdline }}" \
+--cmdline "console=hvc0 root=/dev/ram0 rw debug ipv6.disable=1 conch.sandbox_id={{ .SandboxId }}{{ .SharefsCmdline }}" \
 --api-socket fd={{ .ApiSocketFd }} \
 --console null \
 --net "tap={{ .TapName }}" \
@@ -213,11 +213,11 @@ func (c *CLHClient) Cleanup() {
 	}
 }
 
-func (c *CLHClient) WaitForCreateReady(ctx context.Context, processExited <-chan error) error {
+func (c *CLHClient) WaitForCreateReady(ctx context.Context, _ driver.ProcessExit) error {
 	return c.waitForSourceEvent(ctx, "vm", EventBooted)
 }
 
-func (c *CLHClient) WaitForRestoreReady(ctx context.Context, processExited <-chan error) error {
+func (c *CLHClient) WaitForRestoreReady(ctx context.Context, _ driver.ProcessExit) error {
 	return nil
 }
 
@@ -548,7 +548,7 @@ func (c *CLHClient) requestApi(method, fullCommand, requestBody string) error {
 	return nil
 }
 
-func (c *CLHClient) CheckAgentAlive(ctx context.Context, processExited <-chan error) error {
+func (c *CLHClient) CheckAgentAlive(ctx context.Context, processExited driver.ProcessExit) error {
 	// TODO: call conch-init GetHealth
 	return nil
 }

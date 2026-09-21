@@ -17,7 +17,7 @@ import (
 	"github.com/openeuler/Conch/pkg/ulog"
 )
 
-const SocketDirPerm = 0755
+const SocketDirPerm = 0750
 const unixSocketPathMax = 107
 
 // EnsureWorkSubDir creates a subdirectory under WorkDir and returns its path.
@@ -56,8 +56,9 @@ type Process struct {
 	apiReadyMu      sync.Mutex
 	apiReady        bool
 	// Exit *utils.SetOnce[struct{}]
-	adapter    vmmAdapter
-	exitSignal chan error
+	adapter  vmmAdapter
+	exitDone chan struct{}
+	exitErr  error
 }
 
 func SandboxVmmSocketPath(sandboxId string) (string, error) {
@@ -105,7 +106,7 @@ func NewProcess(
 		VsockSocketPath: vmmResourceArgs.VsockSocketPath,
 		VmmSocketPath:   vmmSocketPath,
 		adapter:         adapter,
-		exitSignal:      make(chan error, 1),
+		exitDone:        make(chan struct{}),
 	}
 
 	startScript, err := adapter.BuildStartCmd(vmmResourceArgs, restore)
@@ -169,8 +170,7 @@ func (p *Process) startCmd(
 				// Check if process was killed by a signal
 				if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() && (status.Signal() == syscall.SIGKILL || status.Signal() == syscall.SIGTERM) {
 					logger.Debug("VMM process killed by signal")
-					p.exitSignal <- nil
-					close(p.exitSignal)
+					p.recordExit(nil)
 					return
 				}
 			}
@@ -178,20 +178,18 @@ func (p *Process) startCmd(
 			logger.Warn("VMM process error",
 				ulog.F("error", errMsg),
 			)
-			p.exitSignal <- errMsg
-			close(p.exitSignal)
+			p.recordExit(errMsg)
 			return
 		}
 		logger.Debug("VMM process exited normally")
-		p.exitSignal <- nil
-		close(p.exitSignal)
+		p.recordExit(nil)
 	}()
 
 	return nil
 }
 
 func (p *Process) waitForAgentAlive(ctx context.Context) error {
-	return p.adapter.CheckAgentAlive(ctx, p.exitSignal)
+	return p.adapter.CheckAgentAlive(ctx, p)
 }
 
 func (p *Process) Create(ctx context.Context) error {
@@ -200,12 +198,12 @@ func (p *Process) Create(ctx context.Context) error {
 	logger.Debug("Creating VMM")
 	err := p.startCmd(ctx)
 	if err != nil {
-		vmmStopErr := p.Stop()
+		vmmStopErr := p.Stop(ctx)
 		return errors.Join(fmt.Errorf("error starting vmm process: %w", err), vmmStopErr)
 	}
 
-	if err := p.adapter.WaitForCreateReady(ctx, p.exitSignal); err != nil {
-		vmmStopErr := p.Stop()
+	if err := p.adapter.WaitForCreateReady(ctx, p); err != nil {
+		vmmStopErr := p.Stop(ctx)
 		return errors.Join(fmt.Errorf("error waiting for vmm create readiness: %w", err), vmmStopErr)
 	}
 	p.markAPIReady()
@@ -213,7 +211,7 @@ func (p *Process) Create(ctx context.Context) error {
 	// check conch-init alive
 	err = p.waitForAgentAlive(ctx)
 	if err != nil {
-		vmmStopErr := p.Stop()
+		vmmStopErr := p.Stop(ctx)
 		return errors.Join(fmt.Errorf("error starting conch-init in vmm: %w", err), vmmStopErr)
 	}
 
@@ -230,33 +228,33 @@ func (p *Process) Restore(ctx context.Context, snapshotPath string) error {
 
 	err := p.startCmd(ctx)
 	if err != nil {
-		vmmStopErr := p.Stop()
+		vmmStopErr := p.Stop(ctx)
 		return errors.Join(fmt.Errorf("error starting vmm process: %w", err), vmmStopErr)
 	}
 
-	if err := p.adapter.WaitForRestoreReady(ctx, p.exitSignal); err != nil {
-		vmmStopErr := p.Stop()
+	if err := p.adapter.WaitForRestoreReady(ctx, p); err != nil {
+		vmmStopErr := p.Stop(ctx)
 		return errors.Join(fmt.Errorf("error waiting for vmm restore readiness: %w", err), vmmStopErr)
 	}
 
 	// preferVNC=false: to achieve fast startup, load memory on demand.
 	err = p.adapter.LoadSnapshot(snapshotPath, false)
 	if err != nil {
-		vmmStopErr := p.Stop()
+		vmmStopErr := p.Stop(ctx)
 		return errors.Join(fmt.Errorf("error loading snapshot: %w", err), vmmStopErr)
 	}
 	p.markAPIReady()
 
 	err = p.adapter.ResumeVM()
 	if err != nil {
-		vmmStopErr := p.Stop()
+		vmmStopErr := p.Stop(ctx)
 		return errors.Join(fmt.Errorf("error resuming vm: %w", err), vmmStopErr)
 	}
 
 	// check conch-init alive
 	err = p.waitForAgentAlive(ctx)
 	if err != nil {
-		vmmStopErr := p.Stop()
+		vmmStopErr := p.Stop(ctx)
 		return errors.Join(fmt.Errorf("error starting conch-init in vmm: %w", err), vmmStopErr)
 	}
 
@@ -273,18 +271,19 @@ func getProcessState(pid int) (string, error) {
 	return state, nil
 }
 
-func (p *Process) Stop() error {
+func (p *Process) Stop(ctx context.Context) error {
 	logger := ulog.GetLogger()
 	var errs []error
 
 	if p.cmd == nil || p.cmd.Process == nil {
-		p.adapter.Cleanup()
-		logger.Warn("VMM process not started")
-		return fmt.Errorf("vmm process not started")
+		if p.adapter != nil {
+			p.adapter.Cleanup()
+		}
+		return nil
 	}
 
 	select {
-	case <-p.exitSignal:
+	case <-p.exitDone:
 		// Already exited
 		p.adapter.Cleanup()
 		return errors.Join(errs...)
@@ -330,7 +329,11 @@ func (p *Process) Stop() error {
 		ulog.F("pid", p.cmd.Process.Pid),
 	)
 
-	<-p.exitSignal
+	select {
+	case <-p.exitDone:
+	case <-ctx.Done():
+		return errors.Join(append(errs, ctx.Err())...)
+	}
 	p.adapter.Cleanup()
 	return errors.Join(errs...)
 }
@@ -366,15 +369,9 @@ func (p *Process) CreateSnapshot(ctx context.Context, snapfilePath string) error
 func (p *Process) Wait() error {
 	logger := ulog.GetLogger()
 
-	// Blocks until single reaper goroutine (in startCmd) sends result.
-	// This ensures only one part of code calls OS wait syscall.
-	err, ok := <-p.exitSignal
-	if !ok {
-		// Channel closed, process already reaped.
-		logger.Debug("Process already reaped")
-		p.adapter.Cleanup()
-		return nil
-	}
+	// Blocks until the single reaper goroutine records its result.
+	<-p.exitDone
+	err := p.Err()
 	p.adapter.Cleanup()
 	if err != nil {
 		logger.Error("VMM process wait error",
@@ -383,4 +380,15 @@ func (p *Process) Wait() error {
 		return err
 	}
 	return nil
+}
+
+func (p *Process) Done() <-chan struct{} { return p.exitDone }
+
+// Err returns the VMM exit result after Done has been closed.
+func (p *Process) Err() error { return p.exitErr }
+
+func (p *Process) recordExit(err error) {
+	// recordExit is called only by the single cmd.Wait reaper started in startCmd.
+	p.exitErr = err
+	close(p.exitDone)
 }

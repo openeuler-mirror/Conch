@@ -2,6 +2,8 @@
 
 Network 模块位于 `internal/netstack`，负责为 Sandbox 创建并复用隔离的网络环境。CNI 管理 Sandbox 对外网络，Conch 管理 network namespace、guest tap 和两层网络之间的地址转换。
 
+当前 Sandbox 数据面和网络策略仅支持 IPv4。VMM cold boot 会禁用 guest IPv6；CNI 返回 IPv6 地址、路由、网关或 DNS 时，Slot 创建失败并回滚。
+
 ## 1. 模块组成
 
 | 组件 | 职责 |
@@ -67,13 +69,15 @@ Conch 在加载 CNI 配置时将 host-local IPAM 的 `dataDir` 设为
 
 ```yaml
 network:
-  warm_pool_size: 250
+  warm_pool_size: 100
+  refill_threshold: 50
   cni:
     plugin_bin_dirs:
       - /usr/libexec/cni
 ```
 
-- `warm_pool_size`：空闲 Slot 的目标数量，默认 250，最大 4000。
+- `warm_pool_size`：空闲 Slot 的目标数量，默认 100，最大 4000。
+- `refill_threshold`：可用 Slot 数降到该阈值或更低时，后台才启动批量补充并恢复至 `warm_pool_size`。配置值必须小于 `warm_pool_size`，未配置或设为 `0` 时使用 `warm_pool_size` 的一半。
 - `plugin_bin_dirs`：CNI 插件二进制目录。
 
 ## 6. 状态与退出

@@ -16,11 +16,16 @@ sandbox:
   backend: stratovirt
   vsock_signal_retry: 10ms
   vsock_signal_timeout: 60s
-  request_timeout: 60s
+  request_timeout: 120s
+  # Valid range: 1.0-5.0. Values above 2.0 are risky and not recommended.
+  memory_overcommit_ratio: 1.0
+  # Total RAM budget for active and creating sandboxes. Minimum: 128 MiB.
+  memory_limit_mb: 65536
   default_spec:
-    # Default Template ID used when a create request does not specify one.
-    # A Template ID is the Template's Boot Index digest.
-    template_id: ""
+    # Default Template selector used when a create request does not specify one.
+    # template_name and template_id are mutually exclusive.
+    template_name: ""
+    # template_id: "sha256:<digest>"
     vcpu_num: 2
     vcpu_max: 2
     ram_mb: 2048
@@ -31,8 +36,10 @@ sandbox:
 
 
 network:
-  # Number of ready-to-use network slots Conch keeps warm. Must not exceed the internal total-slot limit of 4000. Default: 250
+  # Number of ready-to-use network slots Conch keeps warm. Must not exceed the internal total-slot limit of 4000. Default: 100
   warm_pool_size: 100
+  # Refill starts when the number of available warm slots drop below this value. Zero uses half of warm_pool_size.
+  refill_threshold: 50
   cni:
     # CNI plugin binary search paths used for outer sandbox networking.
     # These binaries must be installed on the Linux host; libcni does not install them.

@@ -20,6 +20,8 @@ import (
 	"github.com/openeuler/Conch/internal/snapshot/snapshotter"
 )
 
+const erofsSnapshotterName = "erofs"
+
 // Server manages snapshot lifecycle and per-sandbox boot layouts.
 type Server struct {
 	snt              snapshotter.Snapshotter
@@ -35,6 +37,12 @@ type runtimeSnapshotKey struct {
 	key       string
 }
 
+type RuntimeSnapshotRef struct {
+	Snapshotter string `json:"snapshotter"`
+	Role        string `json:"role"`
+	Key         string `json:"key"`
+}
+
 type BootLayout struct {
 	RootfsMount string // dir which mounts rootfs snapshot view
 	MemMount    string // dir which mounts mem snapshot view or active layer
@@ -43,6 +51,8 @@ type BootLayout struct {
 	SnapshotDir  string           // dir which stores vm snapshot, relative to MemMount
 	MemorySizeMB int64            // memory size of vm, unit is mb
 	MemoryLayout MemoryLayoutMode // storage semantics for Guest RAM artifacts
+
+	RuntimeSnapshots []RuntimeSnapshotRef
 
 	pmemFiles []string // pmem array (e.g. layer1.erofs, layer2.erofs, layer3.erofs)
 }
@@ -171,7 +181,7 @@ func NewServer(workDir string, daemonClient *containerdclient.Client) (*Server, 
 		return nil, fmt.Errorf("containerd client is nil")
 	}
 	erofsSn, err := snapshotter.NewContainerdSnap(
-		daemonClient.SnapshotService("erofs"),
+		daemonClient.SnapshotService(erofsSnapshotterName),
 	)
 	if err != nil {
 		return nil, err
@@ -315,6 +325,9 @@ func (s *Server) CreateBootLayout(
 	if err != nil {
 		return nil, err
 	}
+	layout.RuntimeSnapshots = append(layout.RuntimeSnapshots, RuntimeSnapshotRef{
+		Snapshotter: erofsSnapshotterName, Role: "rootfs", Key: key,
+	})
 	if parents.Rootfs != "" {
 		defer func() {
 			if err != nil {
@@ -327,6 +340,9 @@ func (s *Server) CreateBootLayout(
 	if _, err = s.viewSnapshotMount(ctx, namespace, parents.VM, vmViewSnapshotKey, layout.VMMount); err != nil {
 		return nil, fmt.Errorf("view vm failed: %v", err)
 	}
+	layout.RuntimeSnapshots = append(layout.RuntimeSnapshots, RuntimeSnapshotRef{
+		Snapshotter: erofsSnapshotterName, Role: "vm", Key: vmViewSnapshotKey,
+	})
 	defer func() {
 		if err == nil {
 			return
@@ -365,6 +381,9 @@ func (s *Server) CreateBootLayout(
 		}
 	}()
 	layout.MemMount = memAccessPath
+	layout.RuntimeSnapshots = append(layout.RuntimeSnapshots, RuntimeSnapshotRef{
+		Snapshotter: erofsSnapshotterName, Role: "memory", Key: memKey,
+	})
 
 	if err = ensureMemFile(layout, layout.MemMount, true); err != nil {
 		return nil, fmt.Errorf("prepare mem.img failed: %v", err)
@@ -430,10 +449,16 @@ func (s *Server) RestoreBootLayout(
 		}
 	}()
 	layout.pmemFiles = pmemFiles
+	layout.RuntimeSnapshots = append(layout.RuntimeSnapshots, RuntimeSnapshotRef{
+		Snapshotter: erofsSnapshotterName, Role: "rootfs", Key: rootfsViewSnapshotKey,
+	})
 
 	if _, err := s.viewSnapshotMount(ctx, namespace, parents.VM, vmViewSnapshotKey, layout.VMMount); err != nil {
 		return nil, fmt.Errorf("view vm failed: %v", err)
 	}
+	layout.RuntimeSnapshots = append(layout.RuntimeSnapshots, RuntimeSnapshotRef{
+		Snapshotter: erofsSnapshotterName, Role: "vm", Key: vmViewSnapshotKey,
+	})
 	defer func() {
 		if err == nil {
 			return
@@ -449,6 +474,9 @@ func (s *Server) RestoreBootLayout(
 		if _, err := s.viewSnapshotMount(ctx, namespace, parents.Mem, memViewSnapshotKey, memMountPoint); err != nil {
 			return nil, fmt.Errorf("view checkpoint memory failed: %w", err)
 		}
+		layout.RuntimeSnapshots = append(layout.RuntimeSnapshots, RuntimeSnapshotRef{
+			Snapshotter: erofsSnapshotterName, Role: "memory", Key: memViewSnapshotKey,
+		})
 		defer func() {
 			if err == nil {
 				return
@@ -483,6 +511,9 @@ func (s *Server) RestoreBootLayout(
 		}
 	}()
 	layout.MemMount = memAccessPath
+	layout.RuntimeSnapshots = append(layout.RuntimeSnapshots, RuntimeSnapshotRef{
+		Snapshotter: erofsSnapshotterName, Role: "memory", Key: memKey,
+	})
 
 	if err = ensureMemFile(layout, layout.MemMount, false); err != nil {
 		return nil, fmt.Errorf("mem.img verification failed: %v", err)
@@ -510,36 +541,18 @@ func (s *Server) RestoreBootLayout(
 // ReleaseBootLayout releases active snapshots and per-sandbox views for a runtime layout.
 func (s *Server) ReleaseBootLayout(ctx context.Context, key string) error {
 	namespace := containerdclient.Namespace
-	memKey := getMemKeyFromRootfs(key)
-	var errs []error
-
+	// Both key forms may remain after partial preparation. Each release is
+	// idempotent and only removes the expected snapshot kind.
 	rootfsMount := getActiveMountPath(s.workDir, namespace, key, common.SnapshotMountRootfs)
-	if s.activeSnapshotExists(ctx, namespace, key) {
-		if err := s.releaseActiveSnapshot(ctx, namespace, key, rootfsMount); err != nil {
-			errs = append(errs, err)
-		}
-	} else if err := s.releaseViewSnapshot(ctx, namespace, getRootfsViewSnapshotKey(key), rootfsMount); err != nil {
-		errs = append(errs, err)
-	}
-
 	memMount := getActiveMountPath(s.workDir, namespace, key, common.SnapshotMountMem)
-	if s.activeSnapshotExists(ctx, namespace, memKey) {
-		if err := s.releaseActiveSnapshot(ctx, namespace, memKey, memMount); err != nil {
-			errs = append(errs, err)
-		}
-	} else {
-		memViewSnapshotKey := getMemViewSnapshotKey(key)
-		if s.snapshotKindExists(ctx, namespace, memViewSnapshotKey, snapshots.KindView) {
-			if err := s.releaseViewSnapshot(ctx, namespace, memViewSnapshotKey, memMount); err != nil {
-				errs = append(errs, err)
-			}
-		}
-	}
-	if err := s.releaseViewSnapshot(ctx, namespace, getVMViewSnapshotKey(key), getActiveMountPath(s.workDir, namespace, key, common.SnapshotMountVM)); err != nil {
-		errs = append(errs, err)
-	}
-
-	return errors.Join(errs...)
+	vmMount := getActiveMountPath(s.workDir, namespace, key, common.SnapshotMountVM)
+	return errors.Join(
+		s.releaseActiveSnapshot(ctx, namespace, key, rootfsMount),
+		s.releaseViewSnapshot(ctx, namespace, getRootfsViewSnapshotKey(key), rootfsMount),
+		s.releaseActiveSnapshot(ctx, namespace, getMemKeyFromRootfs(key), memMount),
+		s.releaseViewSnapshot(ctx, namespace, getMemViewSnapshotKey(key), memMount),
+		s.releaseViewSnapshot(ctx, namespace, getVMViewSnapshotKey(key), vmMount),
+	)
 }
 
 // Close releases snapshot resources.

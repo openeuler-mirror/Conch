@@ -11,6 +11,7 @@ import (
 	"github.com/openeuler/Conch/pkg/ulog"
 )
 
+const testDefaultTemplateName = "registry.example.com/conch/default:latest"
 const testDefaultTemplateID = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 func TestGetLogConfig(t *testing.T) {
@@ -117,8 +118,8 @@ func TestLoadConfig(t *testing.T) {
 		"app:\n  name: conch-test\n" +
 			"log:\n  level: debug\n  output: both\n" +
 			"server:\n  work_dir: /tmp/conch\n  state_dir: /tmp/conch-state\n" +
-			"sandbox:\n  backend: cloud-hypervisor\n  default_spec:\n    template_id: " + testDefaultTemplateID + "\n    vcpu_num: 3\n    vcpu_max: 5\n    ram_mb: 2048\n  cloud_hypervisor:\n    binary: /opt/vmm/cloud-hypervisor\n  stratovirt:\n    binary: /opt/vmm/stratovirt\n" +
-			"network:\n  warm_pool_size: 123\n" +
+			"sandbox:\n  backend: cloud-hypervisor\n  memory_overcommit_ratio: 1.5\n  memory_limit_mb: 8192\n  default_spec:\n    template_name: " + testDefaultTemplateName + "\n    vcpu_num: 3\n    vcpu_max: 5\n    ram_mb: 2048\n  cloud_hypervisor:\n    binary: /opt/vmm/cloud-hypervisor\n  stratovirt:\n    binary: /opt/vmm/stratovirt\n" +
+			"network:\n  warm_pool_size: 123\n  refill_threshold: 45\n" +
 			"  cni:\n    plugin_bin_dirs:\n      - /custom/cni/bin\n",
 	)
 	if err := os.WriteFile(cfgPath, data, 0640); err != nil {
@@ -148,6 +149,9 @@ func TestLoadConfig(t *testing.T) {
 	if cfg.Network.WarmPoolSize != 123 {
 		t.Errorf("LoadConfig().Network.WarmPoolSize = %d, want %d", cfg.Network.WarmPoolSize, 123)
 	}
+	if cfg.Network.RefillThreshold != 45 {
+		t.Errorf("LoadConfig().Network.RefillThreshold = %d, want %d", cfg.Network.RefillThreshold, 45)
+	}
 	if len(cfg.Network.CNI.PluginBinDirs) != 1 || cfg.Network.CNI.PluginBinDirs[0] != "/custom/cni/bin" {
 		t.Errorf("LoadConfig().Network.CNI.PluginBinDirs = %v, want [/custom/cni/bin]", cfg.Network.CNI.PluginBinDirs)
 	}
@@ -163,8 +167,14 @@ func TestLoadConfig(t *testing.T) {
 	if cfg.Sandbox.Backend != "cloud-hypervisor" {
 		t.Errorf("LoadConfig().Sandbox.Backend = %q, want cloud-hypervisor", cfg.Sandbox.Backend)
 	}
-	if cfg.Sandbox.DefaultSpec.TemplateID != testDefaultTemplateID {
-		t.Errorf("LoadConfig().Sandbox.DefaultSpec.TemplateID = %q, want %q", cfg.Sandbox.DefaultSpec.TemplateID, testDefaultTemplateID)
+	if cfg.Sandbox.MemoryOvercommitRatio != 1.5 {
+		t.Errorf("LoadConfig().Sandbox.MemoryOvercommitRatio = %v, want 1.5", cfg.Sandbox.MemoryOvercommitRatio)
+	}
+	if cfg.Sandbox.MemoryLimitMB != 8192 {
+		t.Errorf("LoadConfig().Sandbox.MemoryLimitMB = %d, want 8192", cfg.Sandbox.MemoryLimitMB)
+	}
+	if cfg.Sandbox.DefaultSpec.TemplateName != testDefaultTemplateName {
+		t.Errorf("LoadConfig().Sandbox.DefaultSpec.TemplateName = %q, want %q", cfg.Sandbox.DefaultSpec.TemplateName, testDefaultTemplateName)
 	}
 	if cfg.Sandbox.DefaultSpec.VCPUNum != 3 {
 		t.Errorf("LoadConfig().Sandbox.DefaultSpec.VCPUNum = %d, want %d", cfg.Sandbox.DefaultSpec.VCPUNum, 3)
@@ -175,9 +185,36 @@ func TestLoadConfig(t *testing.T) {
 	if cfg.Sandbox.DefaultSpec.RamMB != 2048 {
 		t.Errorf("LoadConfig().Sandbox.DefaultSpec.RamMB = %d, want %d", cfg.Sandbox.DefaultSpec.RamMB, 2048)
 	}
-	if cfg.StatePath() != "/tmp/conch-state/state.db" {
-		t.Errorf("LoadConfig().StatePath() = %q, want /tmp/conch-state/state.db", cfg.StatePath())
-	}
+}
+
+func TestValidateConfigTemplateSelector(t *testing.T) {
+	t.Run("accepts Template ID", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Sandbox.DefaultSpec.TemplateID = "  " + testDefaultTemplateID + "  "
+		if err := validateConfig(cfg); err != nil {
+			t.Fatalf("validateConfig() error = %v", err)
+		}
+		if cfg.Sandbox.DefaultSpec.TemplateID != testDefaultTemplateID {
+			t.Fatalf("TemplateID = %q", cfg.Sandbox.DefaultSpec.TemplateID)
+		}
+	})
+
+	t.Run("rejects Name and ID", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Sandbox.DefaultSpec.TemplateName = testDefaultTemplateName
+		cfg.Sandbox.DefaultSpec.TemplateID = testDefaultTemplateID
+		if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+			t.Fatalf("validateConfig() error = %v", err)
+		}
+	})
+
+	t.Run("rejects invalid ID", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Sandbox.DefaultSpec.TemplateID = "not-a-digest"
+		if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "template_id") {
+			t.Fatalf("validateConfig() error = %v", err)
+		}
+	})
 }
 
 func TestLoadConfigRejectsRemovedCRISection(t *testing.T) {
@@ -245,6 +282,11 @@ func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 			wantErr: "network.warm_pool_size",
 		},
 		{
+			name:    "network refill threshold reaches pool size",
+			data:    "network:\n  warm_pool_size: 10\n  refill_threshold: 10\n",
+			wantErr: "network.refill_threshold",
+		},
+		{
 			name:    "negative volume max mounts",
 			data:    "volume:\n  max_mounts: -1\n",
 			wantErr: "volume.max_mounts",
@@ -283,6 +325,21 @@ func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 			name:    "default ram exceeds maximum",
 			data:    "sandbox:\n  default_spec:\n    ram_mb: 262145\n",
 			wantErr: "sandbox.default_spec.ram_mb",
+		},
+		{
+			name:    "memory overcommit below minimum",
+			data:    "sandbox:\n  memory_overcommit_ratio: 0.9\n",
+			wantErr: "sandbox.memory_overcommit_ratio",
+		},
+		{
+			name:    "memory overcommit above maximum",
+			data:    "sandbox:\n  memory_overcommit_ratio: 5.1\n",
+			wantErr: "sandbox.memory_overcommit_ratio",
+		},
+		{
+			name:    "memory limit below minimum",
+			data:    "sandbox:\n  memory_limit_mb: 127\n",
+			wantErr: "sandbox.memory_limit_mb",
 		},
 		{
 			name:    "unsupported volume backend",
@@ -356,7 +413,7 @@ func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 
 func TestLoadConfigKeepsZeroValueDefaults(t *testing.T) {
 	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
-	data := []byte("network:\n  warm_pool_size: 0\nvolume:\n  max_mounts: 0\n  backend: \"\"\n")
+	data := []byte("network:\n  warm_pool_size: 0\nsandbox:\n  memory_overcommit_ratio: 0\n  memory_limit_mb: 0\nvolume:\n  max_mounts: 0\n  backend: \"\"\n")
 	if err := os.WriteFile(cfgPath, data, 0640); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
@@ -369,11 +426,20 @@ func TestLoadConfigKeepsZeroValueDefaults(t *testing.T) {
 	if cfg.Network.WarmPoolSize != want.Network.WarmPoolSize {
 		t.Errorf("LoadConfig().Network.WarmPoolSize = %d, want default %d", cfg.Network.WarmPoolSize, want.Network.WarmPoolSize)
 	}
+	if cfg.Network.RefillThreshold != want.Network.RefillThreshold {
+		t.Errorf("LoadConfig().Network.RefillThreshold = %d, want default %d", cfg.Network.RefillThreshold, want.Network.RefillThreshold)
+	}
 	if cfg.Volume.MaxMounts != want.Volume.MaxMounts {
 		t.Errorf("LoadConfig().Volume.MaxMounts = %d, want default %d", cfg.Volume.MaxMounts, want.Volume.MaxMounts)
 	}
 	if cfg.Volume.Backend != want.Volume.Backend {
 		t.Errorf("LoadConfig().Volume.Backend = %q, want default %q", cfg.Volume.Backend, want.Volume.Backend)
+	}
+	if cfg.Sandbox.MemoryOvercommitRatio != want.Sandbox.MemoryOvercommitRatio {
+		t.Errorf("LoadConfig().Sandbox.MemoryOvercommitRatio = %v, want default %v", cfg.Sandbox.MemoryOvercommitRatio, want.Sandbox.MemoryOvercommitRatio)
+	}
+	if cfg.Sandbox.MemoryLimitMB != want.Sandbox.MemoryLimitMB {
+		t.Errorf("LoadConfig().Sandbox.MemoryLimitMB = %d, want default %d", cfg.Sandbox.MemoryLimitMB, want.Sandbox.MemoryLimitMB)
 	}
 }
 
@@ -435,6 +501,9 @@ func TestDefaultConfigNetworkSettings(t *testing.T) {
 	if cfg.Network.WarmPoolSize != netstack.DefaultWarmPoolSize {
 		t.Errorf("DefaultConfig().Network.WarmPoolSize = %d, want %d", cfg.Network.WarmPoolSize, netstack.DefaultWarmPoolSize)
 	}
+	if cfg.Network.RefillThreshold != netstack.DefaultWarmPoolSize/2 {
+		t.Errorf("DefaultConfig().Network.RefillThreshold = %d, want %d", cfg.Network.RefillThreshold, netstack.DefaultWarmPoolSize/2)
+	}
 	if len(cfg.Network.CNI.PluginBinDirs) != 1 || cfg.Network.CNI.PluginBinDirs[0] != netstack.DefaultCNIPluginBinDir {
 		t.Errorf("DefaultConfig().Network.CNI.PluginBinDirs = %v, want [%s]", cfg.Network.CNI.PluginBinDirs, netstack.DefaultCNIPluginBinDir)
 	}
@@ -458,8 +527,8 @@ func TestDefaultConfigRuntimePaths(t *testing.T) {
 	if cfg.ContainerdRootDir() != "/var/lib/conch/containerd" || cfg.ContainerdStateDir() != "/var/run/conch/containerd" {
 		t.Errorf("unexpected containerd paths: root=%q state=%q", cfg.ContainerdRootDir(), cfg.ContainerdStateDir())
 	}
-	if cfg.VirtiofsRuntimeDir() != "/var/run/conch/sandboxes" || cfg.StatePath() != "/var/lib/conch/state.db" {
-		t.Errorf("unexpected state paths: virtiofs=%q store=%q", cfg.VirtiofsRuntimeDir(), cfg.StatePath())
+	if cfg.VirtiofsRuntimeDir() != "/var/run/conch/sandboxes" {
+		t.Errorf("unexpected virtiofs runtime path: %q", cfg.VirtiofsRuntimeDir())
 	}
 	if cfg.Sandbox.CloudHypervisor != nil || cfg.Sandbox.Stratovirt == nil || cfg.Sandbox.Stratovirt.Binary != "/usr/bin/stratovirt" {
 		t.Errorf("DefaultConfig().Sandbox.Stratovirt = %#v, want /usr/bin/stratovirt", cfg.Sandbox.Stratovirt)

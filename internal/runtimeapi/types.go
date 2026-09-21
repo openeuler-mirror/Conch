@@ -19,6 +19,22 @@ type SandboxNetworkUpdateOptions struct {
 	Network   *SandboxNetworkConfig
 }
 
+// WebhookCreateOptions describes a Webhook registration for this conchd instance.
+type WebhookCreateOptions struct {
+	Name   string
+	URL    string
+	Events []string
+}
+
+// WebhookRecord is the runtime representation of an in-memory Webhook registration.
+type WebhookRecord struct {
+	WebhookID string
+	Name      string
+	URL       string
+	Events    []string
+	CreatedAt time.Time
+}
+
 // ImageRecord.Kind values exposed by the image API. These classify the
 // user-visible image record, not the io.conch.kind annotation stored on Boot
 // Index component descriptors.
@@ -33,7 +49,7 @@ const (
 
 type SandboxCreateOptions struct {
 	SandboxID    string
-	LeaseID      string
+	TemplateName string
 	TemplateID   string
 	VMMName      string
 	VCPUNum      int64
@@ -45,11 +61,12 @@ type SandboxCreateOptions struct {
 }
 
 type SandboxDefaults struct {
-	TemplateID string
-	VMMName    string
-	VCPUNum    int64
-	VCPUMax    int64
-	RamMB      int64
+	TemplateName string
+	TemplateID   string
+	VMMName      string
+	VCPUNum      int64
+	VCPUMax      int64
+	RamMB        int64
 }
 
 // Sandbox admission limits are intentionally fixed and are not part of the
@@ -60,18 +77,20 @@ const (
 )
 
 type SandboxCreateResult struct {
-	SandboxID  string
-	IP         string
-	AgentToken string
-	TemplateID string
-	VCPUNum    int64
-	RamMB      int64
-	CreatedAt  int64
+	SandboxID    string
+	IP           string
+	AgentToken   string
+	TemplateName string
+	TemplateID   string
+	VCPUNum      int64
+	RamMB        int64
+	CreatedAt    int64
 }
 
 type SandboxCheckpointOptions struct {
-	SandboxID string
-	Labels    map[string]string
+	SandboxID    string
+	TemplateName string
+	Labels       map[string]string
 }
 
 type SandboxCheckpointResult struct {
@@ -79,6 +98,7 @@ type SandboxCheckpointResult struct {
 }
 
 type TemplateCreateOptions struct {
+	Name       string
 	Source     string
 	KernelPath string
 	InitrdPath string
@@ -89,8 +109,8 @@ type TemplateCreateOptions struct {
 }
 
 type TemplateCreateResult struct {
+	Name       string
 	TemplateID string
-	BuildRef   string
 }
 
 type TemplatePullOptions struct {
@@ -102,12 +122,12 @@ type TemplatePullOptions struct {
 }
 
 type TemplatePullResult struct {
+	Name       string
 	TemplateID string
-	BuildRef   string
 }
 
 type TemplatePushOptions struct {
-	TemplateID      string
+	Name            string
 	RemoteReference string
 	PlainHTTP       bool
 	Username        string
@@ -115,7 +135,7 @@ type TemplatePushOptions struct {
 }
 
 type TemplateUnpackOptions struct {
-	TemplateID string
+	Name string
 }
 
 type TemplateListOptions struct {
@@ -124,13 +144,13 @@ type TemplateListOptions struct {
 }
 
 type TemplateRecord struct {
+	Name             string            `json:"name"`
 	TemplateID       string            `json:"template_id"`
 	Origin           string            `json:"origin"`
 	BootMode         string            `json:"boot_mode"`
 	ParentTemplateID string            `json:"parent_template_id,omitempty"`
 	SourceSandboxID  string            `json:"source_sandbox_id,omitempty"`
 	SourceRef        string            `json:"source_ref,omitempty"`
-	BuildRef         string            `json:"build_ref"`
 	Labels           map[string]string `json:"labels,omitempty"`
 	CreatedAt        int64             `json:"created_at,omitempty"`
 }

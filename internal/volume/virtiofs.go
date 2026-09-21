@@ -15,7 +15,7 @@ import (
 	"github.com/moby/sys/mountinfo"
 	"golang.org/x/sys/unix"
 
-	"github.com/openeuler/Conch/internal/sandboxid"
+	"github.com/openeuler/Conch/internal/id"
 	"github.com/openeuler/Conch/pkg/ulog"
 )
 
@@ -241,6 +241,9 @@ func (b *virtiofsBackend) Cleanup(sandboxID string, devices []Device) error {
 		}
 	}
 
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
 	var volumeDir, runtimeDir string
 	for _, device := range devices {
 		if device.VolumeDir != "" {
@@ -255,13 +258,20 @@ func (b *virtiofsBackend) Cleanup(sandboxID string, devices []Device) error {
 		runtimeDir = filepath.Dir(volumeDir)
 	}
 
-	if entries, err := os.ReadDir(volumeDir); err == nil {
+	entries, readErr := os.ReadDir(volumeDir)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		return fmt.Errorf("read volume directory: %w", readErr)
+	}
+	if readErr == nil {
 		for _, entry := range entries {
 			p := filepath.Join(volumeDir, entry.Name())
-			if umountErr := unix.Unmount(p, unix.MNT_DETACH); umountErr != nil && !errors.Is(umountErr, unix.EINVAL) {
+			if umountErr := unix.Unmount(p, unix.MNT_DETACH); umountErr != nil && !errors.Is(umountErr, unix.EINVAL) && !errors.Is(umountErr, unix.ENOENT) {
 				errs = append(errs, fmt.Errorf("unmount %s: %w", p, umountErr))
 			}
 		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		return err
 	}
 	if rmErr := os.RemoveAll(runtimeDir); rmErr != nil {
 		errs = append(errs, fmt.Errorf("remove runtime dir %s: %w", runtimeDir, rmErr))
@@ -298,7 +308,7 @@ func (b *virtiofsBackend) CleanupStaleResources() error {
 		return errors.Join(append(errs, err)...)
 	}
 	for _, entry := range entries {
-		if !entry.IsDir() || sandboxid.Validate(entry.Name()) != nil {
+		if !entry.IsDir() || id.Validate(entry.Name()) != nil {
 			continue
 		}
 		if cleanupErr := b.Cleanup(entry.Name(), nil); cleanupErr != nil {

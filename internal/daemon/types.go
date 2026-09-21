@@ -5,6 +5,30 @@ import (
 	"github.com/openeuler/Conch/internal/volume"
 )
 
+// webhookCreateRequest is the daemon HTTP API payload for registering a Webhook.
+type webhookCreateRequest struct {
+	Name   string   `json:"name"`
+	URL    string   `json:"url"`
+	Events []string `json:"events"`
+}
+
+type webhookResponse struct {
+	WebhookID string   `json:"webhook_id"`
+	Name      string   `json:"name"`
+	URL       string   `json:"url"`
+	Events    []string `json:"events"`
+	CreatedAt string   `json:"createdAt"`
+}
+
+type listWebhooksResponse struct {
+	Webhooks []webhookResponse `json:"webhooks"`
+}
+
+type deleteWebhookResponse struct {
+	WebhookID string `json:"webhook_id"`
+	Status    string `json:"status"`
+}
+
 type pullImageRequest struct {
 	ImageName string `json:"image_name"`
 	PlainHTTP bool   `json:"plain_http,omitempty"`
@@ -54,10 +78,10 @@ type removeSnapshotResponse struct {
 }
 
 type sandboxCreateRequest struct {
+	TemplateName string                           `json:"template_name"`
 	TemplateID   string                           `json:"template_id"`
 	VMMName      string                           `json:"vmm_name"`
 	SandboxID    string                           `json:"sandbox_id"`
-	LeaseID      string                           `json:"lease_id,omitempty"`
 	VCPUNum      int64                            `json:"vcpu_num"`
 	VCPUMax      int64                            `json:"vcpu_max"`
 	RAMMB        int64                            `json:"ram_mb"`
@@ -76,6 +100,7 @@ type sandboxLifecycleResponse struct {
 }
 
 type createSandboxResponse struct {
+	TemplateName         string `json:"templateName"`
 	TemplateID           string `json:"templateID"`
 	SandboxID            string `json:"sandboxID"`
 	ConchInitVersion     string `json:"conchInitVersion"`
@@ -85,6 +110,7 @@ type createSandboxResponse struct {
 }
 
 type sandboxInspectResponse struct {
+	TemplateName     string                           `json:"templateName"`
 	TemplateID       string                           `json:"templateID"`
 	ImageName        string                           `json:"imageName"`
 	SnapshotID       string                           `json:"snapshotID"`
@@ -108,8 +134,9 @@ type sandboxLifecycleRequest struct {
 }
 
 type sandboxCheckpointRequest struct {
-	SandboxID string            `json:"sandbox_id"`
-	Labels    map[string]string `json:"labels,omitempty"`
+	SandboxID    string            `json:"sandbox_id"`
+	TemplateName string            `json:"template_name"`
+	Labels       map[string]string `json:"labels,omitempty"`
 }
 
 type templateListRequest struct {
@@ -117,11 +144,12 @@ type templateListRequest struct {
 	BootMode string `json:"boot_mode,omitempty"`
 }
 
-type templateIDRequest struct {
-	ID string `json:"template_id"`
+type templateNameRequest struct {
+	Name string `json:"name"`
 }
 
 type templateCreateRequest struct {
+	Name      string            `json:"name"`
 	Source    string            `json:"source"`
 	PlainHTTP bool              `json:"plain_http,omitempty"`
 	Username  string            `json:"username,omitempty"`
@@ -138,7 +166,7 @@ type templatePullRequest struct {
 }
 
 type templatePushRequest struct {
-	TemplateID      string `json:"template_id"`
+	Name            string `json:"name"`
 	RemoteReference string `json:"remote_reference"`
 	PlainHTTP       bool   `json:"plain_http,omitempty"`
 	Username        string `json:"username,omitempty"`
@@ -146,7 +174,7 @@ type templatePushRequest struct {
 }
 
 type templateUnpackRequest struct {
-	TemplateID string `json:"template_id"`
+	Name string `json:"name"`
 }
 
 type templateRecordResponse = runtimeapi.TemplateRecord

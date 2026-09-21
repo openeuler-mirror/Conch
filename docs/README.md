@@ -7,6 +7,8 @@
 - [RPM 安装与服务管理](user/rpm-install.md)：通过 RPM 安装并使用 systemd 管理 Conch。
 - [Template 与镜像](user/template.md)：使用 CLI 创建、发布和管理 Template 与镜像。
 - [Python SDK](user/python-sdk.md)：使用 Python 创建和操作 Sandbox。
+- [VSOCK 通信](user/vsock.md)：从 guest 连接 StratoVirt host 上的 VSOCK 服务。
+- [安全说明](user/security.md)：安全模型、信任边界、部署加固要求与需要知悉的既有行为。
 
 ## Conch 开发
 

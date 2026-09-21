@@ -20,8 +20,9 @@ import (
 	"github.com/containerd/plugin/registry"
 
 	containerdclient "github.com/openeuler/Conch/internal/adapters/containerd/client"
+	containerdsandbox "github.com/openeuler/Conch/internal/adapters/containerd/sandbox"
+	containerdtemplate "github.com/openeuler/Conch/internal/adapters/containerd/template"
 	"github.com/openeuler/Conch/internal/cleanupdiag"
-	"github.com/openeuler/Conch/internal/daemon/state"
 	conchsandbox "github.com/openeuler/Conch/internal/sandbox"
 	conchsnapshot "github.com/openeuler/Conch/internal/snapshot"
 	conchtemplate "github.com/openeuler/Conch/internal/template"
@@ -36,11 +37,10 @@ const (
 )
 
 type Config struct {
-	RootDir       string
-	StateDir      string
-	Snapshot      SnapshotConfig
-	TemplateStore state.Store
-	Sandbox       *conchsandbox.Config
+	RootDir  string
+	StateDir string
+	Snapshot SnapshotConfig
+	Sandbox  *conchsandbox.Config
 }
 
 type SnapshotConfig struct {
@@ -52,6 +52,7 @@ type Host struct {
 	client         *containerdclient.Client
 	snapshotServer *conchsnapshot.Server
 	templateStore  conchtemplate.Store
+	sandboxStore   conchsandbox.Store
 	sandboxManager *conchsandbox.Manager
 	cancel         context.CancelFunc
 	once           sync.Once
@@ -67,6 +68,10 @@ func (h *Host) SnapshotServer() *conchsnapshot.Server {
 
 func (h *Host) TemplateStore() conchtemplate.Store {
 	return h.templateStore
+}
+
+func (h *Host) SandboxStore() conchsandbox.Store {
+	return h.sandboxStore
 }
 
 func (h *Host) SandboxManager() *conchsandbox.Manager {
@@ -122,9 +127,6 @@ func Start(ctx context.Context, cfg Config) (*Host, error) {
 	}
 	if cfg.StateDir == "" {
 		return nil, errors.New("containerd state dir is required")
-	}
-	if cfg.Sandbox != nil && cfg.TemplateStore == nil {
-		return nil, errors.New("template store is required when sandbox manager is enabled")
 	}
 	if err := os.MkdirAll(cfg.RootDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create containerd root dir: %w", err)
@@ -185,16 +187,15 @@ func Start(ctx context.Context, cfg Config) (*Host, error) {
 		return fail("snapshot server", err)
 	}
 
-	if cfg.TemplateStore != nil {
-		host.templateStore = conchtemplate.NewStore(cfg.TemplateStore)
-	}
+	host.templateStore = containerdtemplate.NewStore(inst.client)
+	host.sandboxStore = containerdsandbox.NewStore(inst.client.SandboxStore())
 
 	if cfg.Sandbox != nil {
 		host.sandboxManager, err = conchsandbox.New(
 			hostCtx,
 			inst.client,
-			host.templateStore,
 			host.snapshotServer,
+			host.sandboxStore,
 			*cfg.Sandbox,
 		)
 		if err != nil {

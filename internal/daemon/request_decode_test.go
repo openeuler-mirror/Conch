@@ -14,7 +14,6 @@ import (
 
 	containerdclient "github.com/openeuler/Conch/internal/adapters/containerd/client"
 	"github.com/openeuler/Conch/internal/apperror"
-	"github.com/openeuler/Conch/internal/conchruntime"
 )
 
 func TestDecodeStrictJSON(t *testing.T) {
@@ -23,12 +22,13 @@ func TestDecodeStrictJSON(t *testing.T) {
 		body    string
 		wantErr bool
 	}{
-		{name: "known fields", body: `{"template_id":"` + testTemplateIDExplicit + `","volumeMounts":[{"source":"/tmp/data","path":"/data","readonly":true}]}`},
-		{name: "trailing whitespace", body: "{\"template_id\":\"" + testTemplateIDExplicit + "\"}\n\t"},
-		{name: "unknown top-level field", body: `{"template_id":"` + testTemplateIDExplicit + `","volume_mounts":[]}`, wantErr: true},
-		{name: "unknown nested field", body: `{"template_id":"` + testTemplateIDExplicit + `","volumeMounts":[{"source":"/tmp/data","path":"/data","read_only":true}]}`, wantErr: true},
-		{name: "multiple values", body: `{"template_id":"` + testTemplateIDExplicit + `"}{"sandbox_id":"sandbox-2"}`, wantErr: true},
-		{name: "trailing garbage", body: `{"template_id":"` + testTemplateIDExplicit + `"} trailing`, wantErr: true},
+		{name: "known fields", body: `{"template_name":"` + testTemplateNameExplicit + `","volumeMounts":[{"source":"/tmp/data","path":"/data","readonly":true}]}`},
+		{name: "known Template ID", body: `{"template_id":"` + testTemplateIDExplicit + `"}`},
+		{name: "trailing whitespace", body: "{\"template_name\":\"" + testTemplateNameExplicit + "\"}\n\t"},
+		{name: "unknown top-level field", body: `{"template_name":"` + testTemplateNameExplicit + `","volume_mounts":[]}`, wantErr: true},
+		{name: "unknown nested field", body: `{"template_name":"` + testTemplateNameExplicit + `","volumeMounts":[{"source":"/tmp/data","path":"/data","read_only":true}]}`, wantErr: true},
+		{name: "multiple values", body: `{"template_name":"` + testTemplateNameExplicit + `"}{"sandbox_id":"sandbox-2"}`, wantErr: true},
+		{name: "trailing garbage", body: `{"template_name":"` + testTemplateNameExplicit + `"} trailing`, wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -79,7 +79,7 @@ func TestWriteLimitedFileRejectsOversizedInputAndRemovesPartialFile(t *testing.T
 func TestJSONHandlersRejectUnknownFields(t *testing.T) {
 	snapshotOps := &fakeSnapshotService{}
 	sandboxOps := &fakeSandboxOps{}
-	runtimeService := conchruntime.New(sandboxOps, nil, nil)
+	runtimeService := newHandlerRuntime(sandboxOps, nil, nil)
 	runtimeService.Snapshot = snapshotOps
 	server := &Daemon{
 		router:         http.NewServeMux(),
@@ -124,8 +124,8 @@ func TestJSONHandlersRejectUnknownFields(t *testing.T) {
 		})
 	}
 
-	if sandboxOps.createReq.SandboxID != "" || sandboxOps.suspendReq.SandboxID != "" ||
-		sandboxOps.resumeReq.SandboxID != "" || sandboxOps.checkpointReq.SandboxID != "" {
+	if sandboxOps.createReq.SandboxID != "" || sandboxOps.suspendReq != "" ||
+		sandboxOps.resumeReq != "" || sandboxOps.checkpointReq != "" {
 		t.Fatalf("sandbox backend was called: %#v", sandboxOps)
 	}
 	if snapshotOps.infoReq.Key != "" || snapshotOps.removeReq.Key != "" {
@@ -143,7 +143,7 @@ func TestTemplateCreateRejectsUnknownMetadataField(t *testing.T) {
 		t.Fatalf("close multipart body: %v", err)
 	}
 
-	server := &Daemon{router: http.NewServeMux(), runtimeService: conchruntime.New(nil, nil, nil)}
+	server := &Daemon{router: http.NewServeMux(), runtimeService: newHandlerRuntime(nil, nil, nil)}
 	server.routes()
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/api/template/create", &body)
@@ -187,20 +187,25 @@ func TestSandboxCreateRejectsUnknownFieldsWithoutSideEffects(t *testing.T) {
 	}{
 		{
 			name:         "top-level field",
-			body:         `{"template_id":"` + testTemplateIDExplicit + `","sandbox_id":"must-not-exist","volume_mounts":[]}`,
+			body:         `{"template_name":"` + testTemplateNameExplicit + `","sandbox_id":"must-not-exist","volume_mounts":[]}`,
 			unknownField: "volume_mounts",
 		},
 		{
 			name:         "nested field",
-			body:         `{"template_id":"` + testTemplateIDExplicit + `","sandbox_id":"must-not-exist","volumeMounts":[{"source":"/tmp/data","path":"/data","read_only":true}]}`,
+			body:         `{"template_name":"` + testTemplateNameExplicit + `","sandbox_id":"must-not-exist","volumeMounts":[{"source":"/tmp/data","path":"/data","read_only":true}]}`,
 			unknownField: "read_only",
+		},
+		{
+			name:         "removed lease ID",
+			body:         `{"template_name":"` + testTemplateNameExplicit + `","sandbox_id":"must-not-exist","lease_id":"legacy-lease"}`,
+			unknownField: "lease_id",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			sandboxOps := &fakeSandboxOps{}
-			runtimeService := conchruntime.New(sandboxOps, nil, nil)
+			runtimeService := newHandlerRuntime(sandboxOps, nil, nil)
 			server := &Daemon{router: http.NewServeMux(), runtimeService: runtimeService}
 			server.routes()
 
