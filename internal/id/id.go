@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"regexp"
+
+	"github.com/google/uuid"
 )
 
 const (
@@ -27,6 +29,13 @@ func NewWithPrefix(prefix string) (string, error) {
 }
 
 func Validate(value string) error {
+	// uuid.Parse also accepts non-canonical forms (uppercase, braces, urn:
+	// prefix), so require the parsed UUID to round-trip to the exact input.
+	if len(value) == 36 {
+		if parsed, err := uuid.Parse(value); err == nil && parsed.String() == value {
+			return nil
+		}
+	}
 	if len(value) < MinLength || len(value) > MaxLength {
 		return fmt.Errorf("length must be between %d and %d characters", MinLength, MaxLength)
 	}
